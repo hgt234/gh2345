@@ -1,0 +1,6 @@
+{
+  "organization": "example-organization",
+  "project": "example-project",
+  "pipelineId": 1,
+  "branch": "main"
+}
