@@ -13,6 +13,11 @@
     Azure DevOps does the build; nothing is installed or changed on this computer.
     With -WhatIf every check runs but no pipeline run is created.
 
+.PARAMETER Workload
+    Workload that receives the desktop, as listed in the pipeline. It selects the
+    host pool, resource groups, and subnet. Azure DevOps rejects an unknown name
+    during the preview, before anything starts.
+
 .PARAMETER RitmNumber
     RITM followed by 1-12 digits, for example RITM0012345.
 
@@ -30,7 +35,7 @@
     Stay until the pipeline finishes, then show text for the RITM work notes.
 
 .PARAMETER WaitMinutes
-    Maximum wait. The pipeline's job timeouts total about 170 minutes.
+    Maximum wait. The pipeline's job timeouts total about 200 minutes.
 
 .PARAMETER PollSeconds
     Seconds between status checks while waiting.
@@ -40,12 +45,12 @@
     progress always blocks a new one.
 
 .EXAMPLE
-    .\Start-AvdBuild.ps1 -RitmNumber RITM0012345 -RequestedForUpn user@contoso.com -WhatIf
+    .\Start-AvdBuild.ps1 -Workload finance -RitmNumber RITM0012345 -RequestedForUpn user@contoso.com -WhatIf
 
     Runs every check and shows what would be built. Starts nothing.
 
 .EXAMPLE
-    .\Start-AvdBuild.ps1 -RitmNumber RITM0012345 -RequestedForUpn user@contoso.com -Wait
+    .\Start-AvdBuild.ps1 -Workload finance -RitmNumber RITM0012345 -RequestedForUpn user@contoso.com -Wait
 
     Queues the build after confirmation and waits for the result.
 
@@ -57,12 +62,13 @@
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
+    [Parameter(Mandatory)][ValidatePattern('\A[A-Za-z0-9][A-Za-z0-9-]{0,30}\z')][string]$Workload,
     [Parameter(Mandatory)][string]$RitmNumber,
     [Parameter(Mandatory)][string]$RequestedForUpn,
     [ValidateSet('AzCli', 'Pat')][string]$AuthMethod = 'AzCli',
     [string]$SettingsPath = (Join-Path $PSScriptRoot 'Start-AvdBuild.settings.json'),
     [switch]$Wait,
-    [ValidateRange(1, 300)][int]$WaitMinutes = 200,
+    [ValidateRange(1, 300)][int]$WaitMinutes = 230,
     [ValidateRange(15, 600)][int]$PollSeconds = 60,
     [switch]$Force
 )
@@ -133,7 +139,7 @@ function Get-RunBody {
 
     return (@{
         previewRun = $Preview
-        templateParameters = @{ ritmNumber = $ritm; requestedForUpn = $upn }
+        templateParameters = @{ workload = $Workload.ToLowerInvariant(); ritmNumber = $ritm; requestedForUpn = $upn }
         resources = @{ repositories = @{ self = @{ refName = "refs/heads/$($settings.branch)" } } }
     } | ConvertTo-Json -Depth 6 -Compress)
 }
@@ -185,6 +191,7 @@ if ([string]::IsNullOrWhiteSpace([string]$preview.finalYaml)) {
 }
 
 $summary = [ordered]@{
+    Workload = $Workload.ToLowerInvariant()
     RitmNumber = $ritm
     HostName = $hostName
     RequestedForUpn = $upn
@@ -195,7 +202,7 @@ $summary = [ordered]@{
     WorkNote = $null
 }
 
-if (-not $PSCmdlet.ShouldProcess("$hostName for $upn ($ritm)", 'Queue AVD desktop build')) {
+if (-not $PSCmdlet.ShouldProcess("$hostName for $upn ($ritm) in workload $($summary.Workload)", 'Queue AVD desktop build')) {
     return [pscustomobject]$summary
 }
 
@@ -214,7 +221,7 @@ if ($Wait) {
         if ($status.PSObject.Properties['result']) { $summary.Result = [string]$status.result }
     }
     $summary.WorkNote = switch ($summary.Result) {
-        'succeeded' { "AVD desktop $hostName passed readiness and was assigned to $upn. Run: $($summary.RunUrl)" }
+        'succeeded' { "AVD desktop $hostName is Entra-joined, enrolled in Intune, and assigned to $upn. Run: $($summary.RunUrl)" }
         $null { "AVD build for $hostName was still running when the wait ended. Run: $($summary.RunUrl)" }
         default { "AVD build for $hostName ended '$($summary.Result)'. The VM was preserved. Run: $($summary.RunUrl)" }
     }

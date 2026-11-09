@@ -10,6 +10,7 @@ BeforeAll {
         Set-Content -LiteralPath $script:settingsPath
     $env:AZURE_DEVOPS_EXT_PAT = 'fixture-pat'
     $script:request = @{
+        Workload = 'example-workload'
         RitmNumber = 'RITM0012345'
         RequestedForUpn = 'user@contoso.com'
         AuthMethod = 'Pat'
@@ -53,14 +54,15 @@ Describe 'Start-AvdBuild' {
     }
 
     Context 'Queueing' {
-        It 'sends only the two parameters, normalized, for the configured branch' {
-            $result = & $script:starter @script:request -RitmNumber ' ritm0012345 ' -RequestedForUpn 'User@Contoso.com' -Confirm:$false
+        It 'sends only the three parameters, normalized, for the configured branch' {
+            $result = & $script:starter @script:request -Workload 'Example-Workload' -RitmNumber ' ritm0012345 ' -RequestedForUpn 'User@Contoso.com' -Confirm:$false
             $result.RunId | Should -Be 42
             Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
                 if ($Method -ne 'POST' -or -not (Test-RealRunBody $Body)) { return $false }
                 $sent = $Body | ConvertFrom-Json
                 $names = @($sent.templateParameters.PSObject.Properties.Name | Sort-Object)
-                ($names -join ',') -eq 'requestedForUpn,ritmNumber' -and
+                ($names -join ',') -eq 'requestedForUpn,ritmNumber,workload' -and
+                $sent.templateParameters.workload -ceq 'example-workload' -and
                 $sent.templateParameters.ritmNumber -ceq 'RITM0012345' -and
                 $sent.templateParameters.requestedForUpn -ceq 'user@contoso.com' -and
                 $sent.resources.repositories.self.refName -ceq 'refs/heads/main' -and
@@ -107,7 +109,7 @@ Describe 'Start-AvdBuild' {
             Mock Invoke-RestMethod { [pscustomobject]@{ state = 'completed'; result = 'succeeded' } } -ParameterFilter { $Method -eq 'GET' -and $Uri -match '/runs/42\?' }
             $result = & $script:starter @script:request -Wait -Confirm:$false
             $result.Result | Should -Be 'succeeded'
-            $result.WorkNote | Should -BeLike '*AVD0012345*assigned to user@contoso.com*'
+            $result.WorkNote | Should -BeLike '*AVD0012345*enrolled in Intune*assigned to user@contoso.com*'
         }
 
         It 'emits the summary and then fails on a failed run' {
@@ -136,6 +138,94 @@ Describe 'Start-AvdBuild' {
             { & $script:starter @script:request -RitmNumber 'REQ001' -WhatIf } | Should -Throw '*RITM followed by*'
             Should -Invoke Invoke-RestMethod -Times 0 -Exactly
         }
+
+        It 'rejects a workload that could alter the variable group name' {
+            { & $script:starter @script:request -Workload 'a/../b' -WhatIf } | Should -Throw
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly
+        }
+    }
+}
+
+Describe 'Wait-AvdEnrollment' {
+    BeforeAll {
+        $script:enrollment = Join-Path $script:phaseRoot 'scripts/Wait-AvdEnrollment.ps1'
+        $script:reportPath = Join-Path $TestDrive 'enrollment.json'
+        $script:wait = @{ VmName = 'AVD0012345'; ReportPath = $script:reportPath; TimeoutMinutes = 1; PollSeconds = 15 }
+        function az { }
+        function Get-EnrollmentReport { Get-Content -LiteralPath $script:reportPath -Raw | ConvertFrom-Json }
+    }
+
+    BeforeEach {
+        Mock az { $global:LASTEXITCODE = 0; 'fixture-token' }
+        Mock Start-Sleep {}
+        Mock Invoke-RestMethod {
+            [pscustomobject]@{ value = @([pscustomobject]@{ deviceId = 'device-1'; displayName = 'AVD0012345'; accountEnabled = $true; trustType = 'AzureAd' }) }
+        } -ParameterFilter { $Uri -match '/v1\.0/devices\?' }
+        Mock Invoke-RestMethod {
+            [pscustomobject]@{ value = @([pscustomobject]@{ id = 'managed-1'; deviceName = 'AVD0012345'; managementAgent = 'mdm'; azureADDeviceId = 'device-1' }) }
+        } -ParameterFilter { $Uri -match '/managedDevices\?' }
+    }
+
+    It 'passes when the Entra-joined device is enrolled in Intune' {
+        & $script:enrollment @script:wait | Should -BeLike '*enrolled in Intune*'
+        (Get-EnrollmentReport).result | Should -Be 'Enrolled'
+    }
+
+    It 'only reads from Microsoft Graph' {
+        & $script:enrollment @script:wait | Out-Null
+        Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Method -ne 'Get' }
+    }
+
+    It 'fails with the pending state when the wait ends' {
+        Mock Invoke-RestMethod { [pscustomobject]@{ value = @() } } -ParameterFilter { $Uri -match '/managedDevices\?' }
+        { & $script:enrollment @script:wait -TimeoutMinutes 0 } | Should -Throw '*Entra joined: True. Intune enrolled: False*'
+        (Get-EnrollmentReport).result | Should -Be 'TimedOut'
+    }
+
+    Context 'Failures' {
+        BeforeEach {
+            # Stops the script after its first poll so the report can be inspected.
+            Mock Start-Sleep { throw 'stop-after-first-poll' }
+        }
+
+        It 'does not pass a workplace-registered device' {
+            Mock Invoke-RestMethod {
+                [pscustomobject]@{ value = @([pscustomobject]@{ deviceId = 'device-1'; displayName = 'AVD0012345'; accountEnabled = $true; trustType = 'Workplace' }) }
+            } -ParameterFilter { $Uri -match '/v1\.0/devices\?' }
+            { & $script:enrollment @script:wait } | Should -Throw '*stop-after-first-poll*'
+            (Get-EnrollmentReport).entraJoined | Should -BeFalse
+        }
+
+        It 'does not pass a stale Intune record from another device' {
+            Mock Invoke-RestMethod {
+                [pscustomobject]@{ value = @([pscustomobject]@{ id = 'old'; deviceName = 'AVD0012345'; managementAgent = 'mdm'; azureADDeviceId = 'device-old' }) }
+            } -ParameterFilter { $Uri -match '/managedDevices\?' }
+            { & $script:enrollment @script:wait } | Should -Throw '*stop-after-first-poll*'
+            $report = Get-EnrollmentReport
+            $report.entraJoined | Should -BeTrue
+            $report.intuneEnrolled | Should -BeFalse
+        }
+
+        It 'does not pass an unknown management agent' {
+            Mock Invoke-RestMethod {
+                [pscustomobject]@{ value = @([pscustomobject]@{ id = 'managed-1'; deviceName = 'AVD0012345'; managementAgent = 'unknown'; azureADDeviceId = 'device-1' }) }
+            } -ParameterFilter { $Uri -match '/managedDevices\?' }
+            { & $script:enrollment @script:wait } | Should -Throw '*stop-after-first-poll*'
+            (Get-EnrollmentReport).intuneEnrolled | Should -BeFalse
+        }
+
+        It 'retries a Graph failure and never reports the token' {
+            Mock Invoke-RestMethod { throw 'Graph returned 503' } -ParameterFilter { $Uri -match '/v1\.0/devices\?' }
+            { & $script:enrollment @script:wait -WarningAction SilentlyContinue } | Should -Throw '*stop-after-first-poll*'
+            $reportText = Get-Content -LiteralPath $script:reportPath -Raw
+            $reportText | Should -BeLike '*Graph returned 503*'
+            $reportText | Should -Not -BeLike '*fixture-token*'
+        }
+    }
+
+    It 'rejects a host name that could alter the OData filter' {
+        { & $script:enrollment -VmName "AVD1' or 1 eq 1" -ReportPath $script:reportPath } | Should -Throw
+        Should -Invoke Invoke-RestMethod -Times 0 -Exactly
     }
 }
 
@@ -176,17 +266,50 @@ Describe 'Manual pipeline' {
         $script:pipeline | Should -Not -Match '(?i)avd-poc-servicenow|Update-ServiceNowRitm|\bSN_[A-Z]'
     }
 
-    It 'exposes exactly the two technician parameters' {
+    It 'exposes exactly the three technician parameters' {
         $names = @([regex]::Matches($script:pipeline, '(?m)^  - name: (\w+)\r?\n    displayName:') | ForEach-Object { $_.Groups[1].Value })
-        ($names -join ',') | Should -Be 'ritmNumber,requestedForUpn'
+        ($names -join ',') | Should -Be 'workload,ritmNumber,requestedForUpn'
     }
 
-    It 'uses raw parameters only for the run name and validation step' {
+    It 'restricts workload to a list' {
+        $script:pipeline | Should -Match '(?m)^  - name: workload\r?\n(    .*\r?\n)*?    values:'
+    }
+
+    It 'uses raw parameters only for the run name, variable group, and validation step' {
         $uses = @([regex]::Matches($script:pipeline, '(?m)^.*\$\{\{\s*parameters\..*$') | ForEach-Object { $_.Value.Trim() })
-        $uses | Should -HaveCount 3
+        $uses | Should -HaveCount 4
         $uses[0] | Should -BeLike 'name: *'
-        $uses[1] | Should -BeLike 'RITM_NUMBER: *'
-        $uses[2] | Should -BeLike 'REQUESTED_FOR_UPN: *'
+        $uses[1] | Should -Be '- group: avd-phase01-${{ parameters.workload }}'
+        $uses[2] | Should -BeLike 'RITM_NUMBER: *'
+        $uses[3] | Should -BeLike 'REQUESTED_FOR_UPN: *'
+    }
+
+    It 'gates the build on Intune enrollment after readiness' {
+        $script:pipeline.IndexOf('Wait-AvdEnrollment.ps1') | Should -BeGreaterThan $script:pipeline.IndexOf('Wait-AvdReadiness.ps1')
+    }
+}
+
+Describe 'Workload configuration' {
+    BeforeAll {
+        $script:access = Get-Content -LiteralPath (Join-Path $script:phaseRoot 'infra/access.bicep') -Raw
+        $script:variables = Get-Content -LiteralPath (Join-Path $script:phaseRoot 'config/avd-phase01-workload.variables.example.yml') -Raw
+    }
+
+    It 'turns off the app and Defender gates' {
+        $script:variables | Should -Match "AVD_REQUIRED_APP_NAMES_JSON: '\[\]'"
+        $script:variables | Should -Match "AVD_REQUIRE_MDE: 'false'"
+    }
+
+    It 'limits role assignment to the two AVD roles for users' {
+        $script:access | Should -Match "assignableRoleIds = 'fb879df8-f326-4884-b1cf-06f3ad86be52, 1d18fff3-a72a-46b5-b4a9-0b38a3cd7e63'"
+        $script:access | Should -Match 'PrincipalType\] ForAnyOfAnyValues:StringEqualsIgnoreCase'
+        @([regex]::Matches($script:access, 'condition: assignmentCondition')).Count | Should -Be @([regex]::Matches($script:access, "'Microsoft.Authorization/roleAssignments/write'\r?\n")).Count
+    }
+
+    It 'grants no delete action, Run Command, or network write' {
+        $script:access | Should -Not -Match '/delete'
+        $script:access | Should -Not -Match 'runCommand'
+        $script:access | Should -Not -Match 'Microsoft\.Network/virtualNetworks/[^''"]*write'
     }
 
     It 'calls only scripts that exist in the repository' {

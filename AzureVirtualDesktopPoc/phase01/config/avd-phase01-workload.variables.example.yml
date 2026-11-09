@@ -1,0 +1,31 @@
+# Create one Azure DevOps variable group per workload, named avd-phase01-<workload>.
+# Replace every example value. The host pool, application group, and VNet must already exist.
+variables:
+  AVD_POC_ID: EXAMPLE
+  AVD_SUBSCRIPTION_ID: 00000000-0000-0000-0000-000000000000
+  AVD_TENANT_ID: 00000000-0000-0000-0000-000000000000
+  # Must match the VNet region.
+  AVD_LOCATION: centralus
+  # Resource group that receives this workload's VMs.
+  AVD_SESSION_HOST_RESOURCE_GROUP: rg-example-sessionhosts
+  # Resource group holding the existing host pool and desktop application group.
+  AVD_PLATFORM_RESOURCE_GROUP: rg-example-avd
+  AVD_HOST_POOL_NAME: vdpool-example
+  AVD_DESKTOP_APP_GROUP_NAME: vdag-example
+  # Existing subnet in the networking resource group.
+  AVD_SESSION_HOST_SUBNET_ID: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example-network/providers/Microsoft.Network/virtualNetworks/vnet-example/subnets/snet-sessionhosts
+  AVD_VM_SIZE: Standard_E4bs_v5
+  AVD_OS_DISK_SKU: StandardSSD_LRS
+  # Gallery or Marketplace. The two gallery values are ignored for Marketplace.
+  AVD_IMAGE_SOURCE_TYPE: Gallery
+  AVD_GALLERY_IMAGE_DEFINITION_ID: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example-images/providers/Microsoft.Compute/galleries/acgexample/images/win11-avd-personal
+  AVD_GALLERY_IMAGE_VERSION_ID: ''
+  AVD_DSC_CONFIGURATION_URI: https://wvdportalstorageblob.blob.core.windows.net/galleryartifacts/Configuration_1.0.02774.414.zip
+  # Phase 01 gates on Entra join and Intune enrollment only. These stay off.
+  AVD_REQUIRED_APP_NAMES_JSON: '[]'
+  AVD_REQUIRE_INTUNE_COMPLIANT: 'false'
+  AVD_REQUIRE_MDE: 'false'
+  AVD_READINESS_TIMEOUT_MINUTES: '100'
+  AVD_DEPLOYMENT_SERVICE_CONNECTION: sc-avd-example-deploy
+  AVD_READINESS_SERVICE_CONNECTION: sc-avd-example-readiness
+  AVD_ASSIGNMENT_SERVICE_CONNECTION: sc-avd-example-assignment

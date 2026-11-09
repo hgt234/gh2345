@@ -7,6 +7,12 @@ trigger: none
 pr: none
 
 parameters:
+  - name: workload
+    displayName: Workload
+    type: string
+    # One entry per workload; each needs a variable group avd-phase01-<entry>.
+    values:
+      - example-workload
   - name: ritmNumber
     displayName: RITM number (for example RITM0012345)
     type: string
@@ -15,7 +21,8 @@ parameters:
     type: string
 
 variables:
-  - group: avd-poc-platform
+  # The values list above restricts this to known workloads.
+  - group: avd-phase01-${{ parameters.workload }}
   - name: artifactDirectory
     value: $(Build.ArtifactStagingDirectory)/avd-session-host
 
@@ -121,12 +128,12 @@ stages:
       hostName: $[ stageDependencies.ValidateRequest.Validate.outputs['request.hostName'] ]
     jobs:
       - job: ReadinessChecks
-        timeoutInMinutes: 110
+        timeoutInMinutes: 140
         pool:
           vmImage: windows-latest
         steps:
           - task: AzureCLI@2
-            displayName: Check Azure, Entra, Intune, apps, MDE, and AVD
+            displayName: Check Azure, Entra, and AVD
             env:
               REQUIRED_APP_NAMES: $(AVD_REQUIRED_APP_NAMES_JSON)
               REQUIRE_INTUNE_COMPLIANT: $(AVD_REQUIRE_INTUNE_COMPLIANT)
@@ -158,6 +165,19 @@ stages:
                 if ($env:REQUIRE_INTUNE_COMPLIANT -ieq 'true') { $arguments.RequireIntuneCompliant = $true }
                 if ($env:REQUIRE_MDE -ieq 'true') { $arguments.RequireMde = $true }
                 & 'AzureVirtualDesktopPoc/scripts/Wait-AvdReadiness.ps1' @arguments
+          - task: AzureCLI@2
+            displayName: Confirm Entra join and Intune enrollment
+            env:
+              VM_NAME: $(hostName)
+            inputs:
+              azureSubscription: $(AVD_READINESS_SERVICE_CONNECTION)
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $ErrorActionPreference = 'Stop'
+                & 'AzureVirtualDesktopPoc/phase01/scripts/Wait-AvdEnrollment.ps1' `
+                  -VmName $env:VM_NAME `
+                  -ReportPath '$(artifactDirectory)/enrollment.json'
           - task: PublishPipelineArtifact@1
             condition: always()
             inputs:
