@@ -39,6 +39,21 @@ The default image is the template's Windows 11 Enterprise Marketplace image. To 
 
 The script refuses a VM name that already exists in the resource group. If a deployment fails, delete the partial VM and resources, or use a new name.
 
+## Guardrails
+
+The script creates new objects only. It never changes or deletes existing ones:
+
+- It deploys in Incremental mode, which never deletes resources.
+- The Azure what-if may show only `Create`. `Ignore`, `NoChange`, and `NoEffect` are also allowed. Any other result (`Modify`, `Deploy`, `Delete`, `Unsupported`, or an unknown type) stops the run before anything is written. That includes a leftover NIC or disk from an earlier failed run.
+- The what-if runs with a placeholder token. The host pool token is renewed only after the what-if passes.
+- The template references the subnet as `existing`, so it never deploys or changes the subnet or VNet.
+
+Deleting the VM still deletes its NIC and OS disk (`deleteOption: Delete`). The only control that stops a Contributor from deleting a session host is a **CanNotDelete** lock. Contributor can't create or remove locks, so an Owner or User Access Administrator must add one to the VM resource group, for example `az lock create --name avd-vms-no-delete --lock-type CanNotDelete --resource-group <vm-rg>`. The script reads the locks and warns when there is none. Before you add the lock, note:
+
+- Teardown (`scripts/Remove-AvdPoc.ps1`) then needs someone who can remove locks.
+- A resource group lock stops Azure from automatically cleaning up deployment history. Deployments fail once the history reaches 800 entries.
+- A resource group lock also blocks deleting role assignments in that group.
+
 ## After the deployment
 
 1. Check that the session host shows **Available** in the host pool.

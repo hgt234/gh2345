@@ -80,6 +80,22 @@ var requiredTags = {
 var effectiveTags = union(tags, requiredTags)
 var nicName = '${toLower(vmName)}-nic'
 
+// The subnet is referenced with 'existing', so this template never deploys,
+// modifies, or deletes it (or its VNet). subnetId has the fixed form
+// /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/virtualNetworks/{vnet}/subnets/{subnet}.
+// https://learn.microsoft.com/azure/azure-resource-manager/bicep/existing-resource
+var subnetIdSegments = split(subnetId, '/')
+
+resource existingVnet 'Microsoft.Network/virtualNetworks@2024-05-01' existing = {
+  name: subnetIdSegments[8]
+  scope: resourceGroup(subnetIdSegments[2], subnetIdSegments[4])
+}
+
+resource existingSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' existing = {
+  parent: existingVnet
+  name: subnetIdSegments[10]
+}
+
 resource nic 'Microsoft.Network/networkInterfaces@2024-05-01' = {
   name: nicName
   location: location
@@ -92,7 +108,7 @@ resource nic 'Microsoft.Network/networkInterfaces@2024-05-01' = {
         properties: {
           privateIPAllocationMethod: 'Dynamic'
           subnet: {
-            id: subnetId
+            id: existingSubnet.id
           }
         }
       }

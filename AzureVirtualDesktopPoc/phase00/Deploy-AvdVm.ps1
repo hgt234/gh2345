@@ -16,6 +16,15 @@
     With -WhatIf every read-only check and the Azure what-if run, and nothing changes.
     The host pool registration token is renewed only if it is missing or close to expiry.
 
+    Guardrails against changing or deleting existing objects:
+    - The deployment runs in Incremental mode, which never deletes resources.
+    - The Azure what-if must show only Create (Ignore, NoChange, and NoEffect are
+      allowed). Modify, Deploy, Delete, or any other change type stops the run
+      before anything is written, including the token renewal.
+    - The subnet is an 'existing' reference in the template and is never deployed.
+    - A warning is shown when the VM resource group has no CanNotDelete lock.
+      Contributor cannot create or remove locks, so an Owner must add it.
+
 .PARAMETER VmName
     Computer name: 4-15 letters, digits, or hyphens, starting with a letter.
 
@@ -165,31 +174,14 @@ if ($rdpProperties -notmatch '(?i)targetisaadjoined:i:1') {
     Write-Warning "Host pool '$HostPoolName' does not have targetisaadjoined:i:1 in its RDP properties. Users may not be able to connect to Entra-joined VMs."
 }
 
-$registrationToken = Get-RegistrationToken -HostPoolUri $hostPoolUri
-if (-not $registrationToken) {
-    if ($PSCmdlet.ShouldProcess($HostPoolName, "Renew registration token for $tokenRenewalHours hours")) {
-        $body = @{
-            properties = @{
-                registrationInfo = @{
-                    expirationTime = [DateTime]::UtcNow.AddHours($tokenRenewalHours).ToString('o')
-                    registrationTokenOperation = 'Update'
-                }
-            }
-        } | ConvertTo-Json -Depth 5 -Compress
-        $bodyFile = Write-TempJson -Json $body
-        try {
-            [void](Invoke-AzCli -ArgumentList @('rest', '--method', 'PATCH', '--url', "${hostPoolUri}?api-version=$hostPoolApiVersion", '--headers', 'Content-Type=application/json', '--body', "@$bodyFile"))
-        }
-        finally {
-            [IO.File]::Delete($bodyFile)
-        }
-        $registrationToken = Get-RegistrationToken -HostPoolUri $hostPoolUri
-        if (-not $registrationToken) { throw "Host pool '$HostPoolName' did not return a registration token." }
-    }
-    else {
-        # What-if only validates the template, so it does not need a real token.
-        $registrationToken = $whatIfToken
-    }
+# Delete protection: the deployment itself deletes nothing (Incremental mode
+# never deletes, and the what-if below refuses anything but Create). Locks
+# are the only control that stops a Contributor deleting the VM afterwards, and
+# Contributor cannot create or remove locks, so an Owner must place one.
+# https://learn.microsoft.com/azure/azure-resource-manager/management/lock-resources
+$locks = @(Invoke-AzCli -ArgumentList @('lock', 'list', '--resource-group', $ResourceGroupName, '--subscription', $SubscriptionId))
+if (@($locks | Where-Object { [string]$_.level -in @('CanNotDelete', 'ReadOnly') }).Count -eq 0) {
+    Write-Warning "Resource group '$ResourceGroupName' has no CanNotDelete lock. Anyone with Contributor can delete this VM and its disk. Ask an Owner to add one."
 }
 
 $parameterValues = [ordered]@{
@@ -202,37 +194,78 @@ $parameterValues = [ordered]@{
     imageSourceType = @{ value = $(if ($GalleryImageVersionId) { 'Gallery' } else { 'Marketplace' }) }
     galleryImageVersionId = @{ value = [string]$GalleryImageVersionId }
     avdDscConfigurationUri = @{ value = $AvdDscConfigurationUri }
-    registrationToken = @{ value = $registrationToken }
+    # The what-if only validates the template, so it runs with a placeholder
+    # token. The real token is written in just before the deployment.
+    registrationToken = @{ value = $whatIfToken }
     localAdminPassword = @{ value = (Get-RandomPassword) }
     osDiskSku = @{ value = $OsDiskSku }
 }
 if ($Location) { $parameterValues.location = @{ value = $Location } }
-
-$parameterFile = Write-TempJson -Json (@{
+$parameterDocument = [ordered]@{
     '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
     contentVersion = '1.0.0.0'
     parameters = $parameterValues
-} | ConvertTo-Json -Depth 5)
+}
+
+# What-if change types that leave existing resources untouched. Anything else
+# (Modify, Deploy, Delete, Unsupported, or an unknown value) means an existing
+# object would be changed, so the run stops before any write.
+# https://learn.microsoft.com/azure/azure-resource-manager/templates/deploy-what-if#change-types
+$allowedChangeTypes = @('Create', 'Ignore', 'NoChange', 'NoEffect')
 
 $summary = [ordered]@{ VmName = $VmName; HostPool = $HostPoolName; State = 'NotDeployed'; VmId = $null; Changes = @() }
 $deploymentName = "avd-$($VmName.ToLowerInvariant())-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss'))"
+$registrationToken = $null
+
+# No write (token renewal or deployment) happens until the what-if passes.
+$parameterFile = Write-TempJson -Json ($parameterDocument | ConvertTo-Json -Depth 5)
 $deployArguments = @(
     '--resource-group', $ResourceGroupName,
     '--subscription', $SubscriptionId,
     '--template-file', $templateFile,
-    '--parameters', "@$parameterFile"
+    '--parameters', "@$parameterFile",
+    '--mode', 'Incremental'
 )
 try {
     $whatIf = Invoke-AzCli -ArgumentList (@('deployment', 'group', 'what-if', '--name', $deploymentName, '--no-pretty-print', '--result-format', 'ResourceIdOnly') + $deployArguments)
+    if (-not $whatIf -or -not $whatIf.PSObject.Properties['changes']) {
+        throw 'Azure what-if returned no result. Nothing was deployed.'
+    }
     $changes = @($whatIf.changes)
     $summary.Changes = @($changes | ForEach-Object { "$($_.changeType): $($_.resourceId)" })
-    if (@($changes | Where-Object { [string]$_.changeType -in @('Delete', 'Recreate') }).Count -gt 0) {
-        throw "The deployment would delete or recreate a resource: $($summary.Changes -join '; ')"
+    $refused = @($changes | Where-Object { [string]$_.changeType -notin $allowedChangeTypes })
+    if ($refused.Count -gt 0) {
+        throw ("The deployment would change existing resources, and this script only creates new ones: {0}" -f
+            (@($refused | ForEach-Object { "$($_.changeType): $($_.resourceId)" }) -join '; '))
     }
 
     if ($PSCmdlet.ShouldProcess("$VmName in $ResourceGroupName", "Deploy session host for host pool $HostPoolName")) {
+        $registrationToken = Get-RegistrationToken -HostPoolUri $hostPoolUri
+        if (-not $registrationToken -and $PSCmdlet.ShouldProcess($HostPoolName, "Renew registration token for $tokenRenewalHours hours")) {
+            $body = @{
+                properties = @{
+                    registrationInfo = @{
+                        expirationTime = [DateTime]::UtcNow.AddHours($tokenRenewalHours).ToString('o')
+                        registrationTokenOperation = 'Update'
+                    }
+                }
+            } | ConvertTo-Json -Depth 5 -Compress
+            $bodyFile = Write-TempJson -Json $body
+            try {
+                [void](Invoke-AzCli -ArgumentList @('rest', '--method', 'PATCH', '--url', "${hostPoolUri}?api-version=$hostPoolApiVersion", '--headers', 'Content-Type=application/json', '--body', "@$bodyFile"))
+            }
+            finally {
+                [IO.File]::Delete($bodyFile)
+            }
+            $registrationToken = Get-RegistrationToken -HostPoolUri $hostPoolUri
+            if (-not $registrationToken) { throw "Host pool '$HostPoolName' did not return a registration token." }
+        }
+    }
+    if ($registrationToken) {
+        $parameterValues.registrationToken = @{ value = $registrationToken }
+        [IO.File]::WriteAllText($parameterFile, ($parameterDocument | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
         Write-Information -MessageData "Deploying $VmName. This can take 20 minutes." -InformationAction Continue
-        $deployment = Invoke-AzCli -ArgumentList (@('deployment', 'group', 'create', '--name', $deploymentName, '--mode', 'Incremental') + $deployArguments)
+        $deployment = Invoke-AzCli -ArgumentList (@('deployment', 'group', 'create', '--name', $deploymentName) + $deployArguments)
         $summary.State = 'Deployed'
         $summary.VmId = [string]$deployment.properties.outputs.vmId.value
     }
@@ -240,6 +273,8 @@ try {
 finally {
     [IO.File]::Delete($parameterFile)
     $registrationToken = $null
+    $parameterValues = $null
+    $parameterDocument = $null
 }
 
 [pscustomobject]$summary
