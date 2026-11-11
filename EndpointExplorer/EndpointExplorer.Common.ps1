@@ -1283,6 +1283,8 @@ th.check, td.check { width: 28px; }
 .rollout-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-secondary); }
 .rollout-form label.check { flex-direction: row; align-items: center; gap: 6px; }
 .rollout-panel table { margin: 6px 0 10px; }
+.rollout-panel td.file-actions { white-space: nowrap; text-align: right; }
+.rollout-panel td.file-actions button + button { margin-left: 6px; }
 .error { color: var(--critical); }
 .ok { color: var(--good); }
 </style>
@@ -1536,7 +1538,7 @@ var EndpointRollout = (function () {
     return out;
   }
 
-  return { build: build, zip: zip, parseVersion: parseVersion, compareVersion: compareVersion, phaseCounts: phaseCounts,
+  return { build: build, zip: zip, csvBytes: utf8WithBom, parseVersion: parseVersion, compareVersion: compareVersion, phaseCounts: phaseCounts,
     parsePercentages: parsePercentages, stamp: stamp, fileSafe: fileSafe, DETAIL_COLUMNS: DETAIL_COLUMNS };
 })();
 </script>
@@ -1810,7 +1812,7 @@ var EndpointRollout = (function () {
   drawer.onclick = function (e) {
     if (e.target.closest('.close')) { closeDrawer(); return; }
     var action = e.target.closest('[data-act]');
-    if (action) { rolloutAction(action.getAttribute('data-act')); return; }
+    if (action) { rolloutAction(action.getAttribute('data-act'), action); return; }
     var link = e.target.closest('[data-device]');
     if (link) { openDevice(devices[+link.getAttribute('data-device')]); return; }
     var appLink = e.target.closest('[data-app]');
@@ -1909,7 +1911,7 @@ var EndpointRollout = (function () {
     if (!count) { document.getElementById('rollout-panel').innerHTML = ''; }
     else if (document.getElementById('rollout-pct')) { renderRolloutPreview(); }
   }
-  function rolloutAction(act) {
+  function rolloutAction(act, el) {
     var a = rollout.app; if (!a) { return; }
     if (act === 'sel-all') { (a.recordIndexes || []).forEach(function (ri) { rollout.selected[ri] = true; }); updateSelection(); }
     else if (act === 'sel-none') { rollout.selected = {}; updateSelection(); }
@@ -1927,6 +1929,8 @@ var EndpointRollout = (function () {
     else if (act === 'rollout-open') { renderRolloutPanel(); }
     else if (act === 'rollout-cancel') { document.getElementById('rollout-panel').innerHTML = ''; }
     else if (act === 'rollout-download') { downloadRollout(); }
+    else if (act === 'file-copy') { copyRolloutFile(+el.getAttribute('data-file')); }
+    else if (act === 'file-download') { downloadRolloutFile(+el.getAttribute('data-file')); }
   }
   drawer.addEventListener('change', function (e) {
     var box = e.target.closest('input[data-ri]');
@@ -1941,11 +1945,14 @@ var EndpointRollout = (function () {
       '<label>Phase percentages<input type="text" id="rollout-pct" value="10,30,60" size="14"></label>' +
       '<label>Active within days<input type="number" id="rollout-days" value="90" min="0" max="3650" style="width:90px"></label>' +
       '<label class="check"><input type="checkbox" id="rollout-require"> Require primary user</label></div>' +
-      '<div id="rollout-preview"></div>' +
-      '<div class="toolbar"><button class="primary" data-act="rollout-download" id="rollout-download">Download .zip</button>' +
+      '<div id="rollout-preview"></div><div id="rollout-files"></div>' +
+      '<div class="toolbar"><button class="primary" data-act="rollout-download" id="rollout-download">Download all (.zip)</button>' +
       '<button data-act="rollout-cancel">Cancel</button><span class="count" id="rollout-status"></span></div>' +
       '<div class="note">Same files and columns as PhasedRollout/phased-rollout-creator.ps1. Built from this snapshot (' + esc(fmtDate(data.generatedAt)) +
-      '): primary users, check-ins, and app versions are as of then. No Graph calls are made.</div></div>';
+      '): primary users, check-ins, and app versions are as of then. No Graph calls are made.</div>' +
+      '<div class="note">Browsers mark every downloaded file as coming from the internet (Mark of the Web), and some policies block opening or extracting such files. ' +
+      'A downloaded CSV can still be uploaded to the Entra group bulk import without opening it. To get a file you can open, use Copy, paste into Notepad, ' +
+      'and save it as .csv: pasted text carries no mark. Choose "UTF-8 with BOM" in Notepad to match the downloaded files byte for byte.</div></div>';
     renderRolloutPreview();
   }
   function rolloutOptions() {
@@ -1955,12 +1962,15 @@ var EndpointRollout = (function () {
     return { error: error, percentages: pct.values, activeWithinDays: days, requirePrimaryUser: document.getElementById('rollout-require').checked };
   }
   function renderRolloutPreview() {
-    var opts = rolloutOptions(), preview = document.getElementById('rollout-preview');
+    var opts = rolloutOptions(), preview = document.getElementById('rollout-preview'), filesDiv = document.getElementById('rollout-files');
     var button = document.getElementById('rollout-download');
-    rollout.result = null;
+    rollout.result = null; filesDiv.innerHTML = ''; document.getElementById('rollout-status').innerHTML = '';
     if (opts.error) { preview.innerHTML = '<div class="error">' + esc(opts.error) + '</div>'; button.disabled = true; return; }
-    var r = EndpointRollout.build(data, selectedIndexes(), { percentages: opts.percentages, activeWithinDays: opts.activeWithinDays, requirePrimaryUser: opts.requirePrimaryUser, stamp: 'preview' });
-    rollout.result = r;
+    // Built with a real timestamp so every Copy/Download of this set, and the
+    // zip, share one tag; a settings or selection change starts a new set.
+    var now = new Date();
+    var r = EndpointRollout.build(data, selectedIndexes(), { percentages: opts.percentages, activeWithinDays: opts.activeWithinDays, requirePrimaryUser: opts.requirePrimaryUser, stamp: EndpointRollout.stamp(now) });
+    rollout.result = r; rollout.builtAt = now;
     var rows = opts.percentages.map(function (p, i) { return ['Phase ' + (i + 1) + ' (' + p + '%)', r.phaseCounts[i]]; });
     rows.push(['Inactive (no check-in for ' + opts.activeWithinDays + '+ days)', r.inactive]);
     var reasons = {};
@@ -1973,17 +1983,47 @@ var EndpointRollout = (function () {
     if (r.noPrimaryUser) { html += '<div class="count warn">' + num(r.noPrimaryUser) + ' device(s) have no primary user; their UPN is blank. Tick Require primary user to skip them.</div>'; }
     preview.innerHTML = html;
     button.disabled = r.rows.length === 0;
+    if (r.rows.length) {
+      // Files are ordered detail, Phase 1..N, Inactive (see EndpointRollout.build).
+      var fileRows = [r.rows.length].concat(r.phaseCounts, [r.inactive]);
+      filesDiv.innerHTML = '<table><thead><tr><th>File</th><th class="num">Devices</th><th></th></tr></thead><tbody>' +
+        r.files.map(function (f, i) {
+          return '<tr><td>' + esc(f.name) + '</td><td class="num">' + num(fileRows[i]) + '</td>' +
+            '<td class="file-actions"><button data-act="file-copy" data-file="' + i + '">Copy</button>' +
+            '<button data-act="file-download" data-file="' + i + '">Download</button></td></tr>';
+        }).join('') + '</tbody></table>';
+    }
   }
-  function downloadRollout() {
-    var opts = rolloutOptions(); if (opts.error) { return; }
-    var now = new Date(), tag = EndpointRollout.stamp(now);
-    var r = EndpointRollout.build(data, selectedIndexes(), { percentages: opts.percentages, activeWithinDays: opts.activeWithinDays, requirePrimaryUser: opts.requirePrimaryUser, stamp: tag });
-    var name = 'PhasedRollout-' + EndpointRollout.fileSafe(rollout.app.name) + '-' + tag + '.zip';
-    var url = URL.createObjectURL(new Blob([EndpointRollout.zip(r.files, now)], { type: 'application/zip' }));
-    var link = document.createElement('a');
+  function setRolloutStatus(cls, text) { document.getElementById('rollout-status').innerHTML = '<span class="' + cls + '">' + esc(text) + '</span>'; }
+  function saveBlob(blob, name) {
+    var url = URL.createObjectURL(blob), link = document.createElement('a');
     link.href = url; link.download = name; document.body.appendChild(link); link.click(); link.remove();
     setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
-    document.getElementById('rollout-status').innerHTML = '<span class="ok">Downloaded ' + esc(name) + ' (' + r.files.length + ' files).</span>';
+  }
+  function downloadRollout() {
+    var r = rollout.result; if (!r || !r.rows.length) { return; }
+    var name = 'PhasedRollout-' + EndpointRollout.fileSafe(rollout.app.name) + '-' + EndpointRollout.stamp(rollout.builtAt) + '.zip';
+    saveBlob(new Blob([EndpointRollout.zip(r.files, rollout.builtAt)], { type: 'application/zip' }), name);
+    setRolloutStatus('ok', 'Downloaded ' + name + ' (' + r.files.length + ' files).');
+  }
+  function downloadRolloutFile(i) {
+    var f = rollout.result && rollout.result.files[i]; if (!f) { return; }
+    // Same bytes as the zip entry: UTF-8 with BOM, CRLF.
+    saveBlob(new Blob([EndpointRollout.csvBytes(f.text)], { type: 'text/csv' }), f.name);
+    setRolloutStatus('ok', 'Downloaded ' + f.name + '.');
+  }
+  function copyRolloutFile(i) {
+    var f = rollout.result && rollout.result.files[i]; if (!f) { return; }
+    var done = function () { setRolloutStatus('ok', 'Copied ' + f.name + '. Paste into Notepad and save with that name.'); };
+    var failed = function () { setRolloutStatus('error', 'Could not copy ' + f.name + ' to the clipboard. Use Download instead.'); };
+    if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(f.text).then(done, failed); return; }
+    // Fallback for browsers that do not expose the async Clipboard API here.
+    var area = document.createElement('textarea');
+    area.value = f.text; area.setAttribute('readonly', ''); area.style.position = 'fixed'; area.style.top = '-1000px';
+    document.body.appendChild(area); area.select();
+    var ok = false; try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    area.remove();
+    if (ok) { done(); } else { failed(); }
   }
 
   renderDevices();

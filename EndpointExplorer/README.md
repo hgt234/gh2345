@@ -173,11 +173,34 @@ entirely in the browser, with no Graph calls. This needs per-device apps:
    **Active within days** (default 90, as in the script), and optionally
    **Require primary user**. The preview shows the device count per phase, the
    inactive count, and every skipped device with the reason.
-4. Click **Download .zip**. The download is
-   `PhasedRollout-<app>-<timestamp>.zip` and contains:
+4. The panel lists the files, each with **Copy** and **Download**, and
+   **Download all (.zip)** saves them together as
+   `PhasedRollout-<app>-<timestamp>.zip`:
    - `PhasedRolloutDetail-<timestamp>.csv`
    - `Phase<N>-EntraGroupImport-<timestamp>.csv`
    - `Inactive-EntraGroupImport-<timestamp>.csv`
+
+   All files in one set share a timestamp. Changing the settings or the
+   version selection starts a new set with a new timestamp.
+
+#### Blocked downloads (Mark of the Web)
+
+Browsers tag every file they save as coming from the internet (the Mark of the
+Web). This includes files the page builds itself and files saved through the
+File System Access API. On machines whose policy blocks such files, and hides
+**Unblock** in file properties, the zip cannot be extracted and its CSVs cannot
+be opened. Changing how the report saves files cannot avoid the tag. Instead:
+
+- **Upload without opening:** use **Download** on a single group-import CSV and
+  upload it in the Entra group **Bulk operations > Import members**. Uploading a
+  tagged file is not blocked.
+- **Open the file:** use **Copy**, paste into Notepad, and save it with the file
+  name shown. Text pasted from the clipboard carries no tag. Choose
+  **UTF-8 with BOM** as the encoding to match the downloaded files byte for byte.
+- **Write straight to disk:** run
+  [phased-rollout-creator.ps1](../PhasedRollout/phased-rollout-creator.ps1). It
+  writes the same files directly, but it queries Graph live instead of using
+  the snapshot.
 
 These match the script's `-AppName` mode file for file:
 

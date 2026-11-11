@@ -766,7 +766,8 @@ vm.runInThisContext(fs.readFileSync(libPath, 'utf8'));
 const data = JSON.parse(fs.readFileSync(dataPath, 'utf8')), args = JSON.parse(fs.readFileSync(argsPath, 'utf8'));
 args.options.referenceTime = Date.now();
 const result = EndpointRollout.build(data, args.recordIndexes, args.options);
-fs.writeFileSync(outPath, JSON.stringify({ files: result.files, skipped: result.skipped, rows: result.rows.length }));
+const csvBytes = result.files.map(f => Buffer.from(EndpointRollout.csvBytes(f.text)).toString('base64'));
+fs.writeFileSync(outPath, JSON.stringify({ files: result.files, csvBytes: csvBytes, skipped: result.skipped, rows: result.rows.length }));
 fs.writeFileSync(zipPath, EndpointRollout.zip(result.files));
 '@)
 
@@ -841,6 +842,17 @@ fs.writeFileSync(zipPath, EndpointRollout.zip(result.files));
             @($bytes[0..2]) | Should -Be @(0xEF, 0xBB, 0xBF)
             [Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3) | Should -BeExactly $file.text
             $file.text | Should -Match "`r`n$"
+        }
+    }
+
+    It 'downloads each CSV with the same bytes as its zip entry' {
+        $case = Invoke-ParityCase -AppName 'Google Chrome' -MaxVersion '130' -Name 'single'
+        $extract = Join-Path $TestDrive 'single-out'
+        Expand-Archive -LiteralPath $case.ZipPath -DestinationPath $extract
+        @($case.Js.csvBytes).Count | Should -Be @($case.Js.files).Count
+        for ($i = 0; $i -lt @($case.Js.files).Count; $i++) {
+            $zipBytes = [IO.File]::ReadAllBytes((Join-Path $extract $case.Js.files[$i].name))
+            [Convert]::FromBase64String($case.Js.csvBytes[$i]) | Should -Be $zipBytes
         }
     }
 }
