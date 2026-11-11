@@ -459,3 +459,73 @@ Describe 'Quick validation preset' {
         $plan[0].Arguments | Should -Contain '-C0'
     }
 }
+
+Describe 'Volume identity (FSLogix profile on C:\Users path)' {
+    It 'extracts the volume device from an NT final path' {
+        Get-AvdVolumeDeviceFromNtPath -NtPath '\Device\HarddiskVolume12\Profile\AvdStorageBenchmark' | Should -Be '\Device\HarddiskVolume12'
+        Get-AvdVolumeDeviceFromNtPath -NtPath 'C:\Users\u' | Should -BeNullOrEmpty
+    }
+
+    It 'treats a profile with the same C:\ root but a different resolved device as a separate volume (regression)' {
+        $os = [pscustomobject]@{ VolumeRoot = 'C:\'; VolumeDevice = '\Device\HarddiskVolume3'; TotalBytes = 136365211648 }
+        $profileVolume = [pscustomobject]@{ VolumeRoot = 'C:\'; VolumeDevice = '\Device\HarddiskVolume12'; TotalBytes = 136365211648 }
+        Test-AvdSameVolume -First $profileVolume -Second $os | Should -BeFalse
+    }
+
+    It 'treats a different capacity as a separate volume even when the device matches (filter-driver redirection)' {
+        $os = [pscustomobject]@{ VolumeRoot = 'C:\'; VolumeDevice = '\Device\HarddiskVolume3'; TotalBytes = 136365211648 }
+        $profileVolume = [pscustomobject]@{ VolumeRoot = 'C:\'; VolumeDevice = '\Device\HarddiskVolume3'; TotalBytes = 32212254720 }
+        Test-AvdSameVolume -First $profileVolume -Second $os | Should -BeFalse
+    }
+
+    It 'reports the same volume when device and capacity both match' {
+        $a = [pscustomobject]@{ VolumeRoot = 'C:\'; VolumeDevice = '\device\harddiskvolume3'; TotalBytes = 100 }
+        $b = [pscustomobject]@{ VolumeRoot = 'C:\'; VolumeDevice = '\Device\HarddiskVolume3'; TotalBytes = 100 }
+        Test-AvdSameVolume -First $a -Second $b | Should -BeTrue
+    }
+
+    It 'falls back to the path root when no device is known' {
+        $a = [pscustomobject]@{ VolumeRoot = 'F:\'; VolumeDevice = $null; TotalBytes = 0 }
+        $b = [pscustomobject]@{ VolumeRoot = 'C:\'; VolumeDevice = $null; TotalBytes = 0 }
+        Test-AvdSameVolume -First $a -Second $b | Should -BeFalse
+    }
+}
+
+Describe 'Cloud Cache detection' {
+    It 'counts providers by type from REG_MULTI_SZ without keeping paths' {
+        $value = @('type=smb,name="Primary",connectionString=\\files1.example.test\profiles', 'type=azure,name="Blob",connectionString="|fslogix/key1|"')
+        $summary = Get-AvdCloudCacheProviderSummary -CcdLocations $value
+        $summary.Configured | Should -BeTrue
+        $summary.Smb | Should -Be 1
+        $summary.Azure | Should -Be 1
+        ($summary | ConvertTo-Json) | Should -Not -BeLike '*example.test*'
+    }
+
+    It 'counts providers in a single REG_SZ value' {
+        (Get-AvdCloudCacheProviderSummary -CcdLocations 'type=smb,connectionString=\\a\p;type=smb,connectionString=\\b\p').Smb | Should -Be 2
+    }
+
+    It 'reports not configured for a null value' {
+        (Get-AvdCloudCacheProviderSummary -CcdLocations $null).Configured | Should -BeFalse
+    }
+
+    It 'explains that a Cloud Cache profile measures the local cache, not the share' {
+        $cc = Get-AvdCloudCacheProviderSummary -CcdLocations 'type=smb,connectionString=\\a\p'
+        $notes = @(Get-AvdProfileStorageNote -FslogixEnabled 1 -ProfileOnOsVolume $false -CloudCache $cc -CacheDirectory 'C:\ProgramData\FSLogix\Cache' -CacheOnOsVolume $true)
+        $notes[0] | Should -BeLike "Cloud Cache: *local cache in 'C:\ProgramData\FSLogix\Cache' (on the OS disk)*1 provider(s)*"
+        $notes[1] | Should -BeLike '*sign-out waits*'
+        @($notes | Where-Object { $_ -like '*no profile container*' }).Count | Should -Be 0
+    }
+
+    It 'warns only when the profile really is on the OS volume' {
+        $none = Get-AvdCloudCacheProviderSummary -CcdLocations $null
+        $notes = @(Get-AvdProfileStorageNote -FslogixEnabled 1 -ProfileOnOsVolume $true -CloudCache $none)
+        $notes.Count | Should -Be 1
+        $notes[0] | Should -BeLike '*no profile container is attached*'
+    }
+
+    It 'notes VHD growth for a classic VHDLocations container' {
+        $none = Get-AvdCloudCacheProviderSummary -CcdLocations $null
+        @(Get-AvdProfileStorageNote -FslogixEnabled 1 -ProfileOnOsVolume $false -CloudCache $none)[0] | Should -BeLike '*grows the dynamic profile VHD(X)*'
+    }
+}

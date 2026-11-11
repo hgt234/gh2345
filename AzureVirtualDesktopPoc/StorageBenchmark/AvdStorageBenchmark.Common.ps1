@@ -766,19 +766,96 @@ function Remove-AvdTestFile {
     }
 }
 
+function Get-AvdVolumeDeviceFromNtPath {
+    <#
+    .SYNOPSIS
+        Extracts the volume device ('\Device\HarddiskVolume3') from an NT path
+        returned by GetFinalPathNameByHandle with VOLUME_NAME_NT.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $NtPath)
+    if ($NtPath -match '^(\\Device\\[^\\]+)') { return $Matches[1] }
+    return $null
+}
+
+function Get-AvdCloudCacheProviderSummary {
+    <#
+    .SYNOPSIS
+        Counts Cloud Cache providers by type from the CCDLocations value
+        (REG_SZ or REG_MULTI_SZ). Only types are returned; share paths and
+        key names are never copied into results.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([AllowNull()] [object] $CcdLocations)
+    $text = (@($CcdLocations) | Where-Object { $null -ne $_ }) -join "`n"
+    # Values are case sensitive per the FSLogix reference ('type=smb', 'type=azure').
+    $smb = ([regex]::Matches($text, '(?<![A-Za-z])type=smb(?![A-Za-z])')).Count
+    $azure = ([regex]::Matches($text, '(?<![A-Za-z])type=azure(?![A-Za-z])')).Count
+    [pscustomobject]@{ Configured = ($text.Trim() -ne ''); Smb = $smb; Azure = $azure; Total = $smb + $azure }
+}
+
+function Get-AvdProfileStorageNote {
+    <#
+    .SYNOPSIS
+        Explains what the Profile target actually measures, from discovered
+        FSLogix state and volume identities.
+
+    .DESCRIPTION
+        FSLogix Cloud Cache (Microsoft Learn, "Cloud Cache Overview") runs the
+        session from a local cache VHD(X) in CacheDirectory (default
+        C:\ProgramData\FSLogix\Cache), hydrates missing data from the first
+        CCDLocations provider, and flushes writes asynchronously to all
+        providers; sign-out waits until providers have caught up.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [AllowNull()] [object] $FslogixEnabled,
+        [Parameter(Mandatory)] [bool] $ProfileOnOsVolume,
+        [Parameter(Mandatory)] [pscustomobject] $CloudCache,
+        [AllowEmptyString()] [string] $CacheDirectory = '',
+        [bool] $CacheOnOsVolume = $true
+    )
+    $notes = @()
+    if ($FslogixEnabled -ne 1) { $notes += 'FSLogix Profiles is not enabled (HKLM\SOFTWARE\FSLogix\Profiles\Enabled is not 1).' }
+    if ($ProfileOnOsVolume) {
+        $notes += 'Profile path resolves to the OS volume; no profile container is attached for this user, so this target measures the OS disk.'
+        return $notes
+    }
+    if ($CloudCache.Configured) {
+        $where = 'on the OS disk'
+        if (-not $CacheOnOsVolume) { $where = 'not on the OS disk' }
+        $notes += ("Cloud Cache: profile IO is served by the local cache in '{0}' ({1}). Writes flush asynchronously to {2} provider(s) (smb: {3}, azure: {4}); smb flushes appear in the SMB Client Shares counters. This target measures the local cache path plus flush overhead, not the remote share directly." -f $CacheDirectory, $where, $CloudCache.Total, $CloudCache.Smb, $CloudCache.Azure)
+        $notes += 'Cloud Cache: test data is flushed to every provider and sign-out waits until providers catch up; prefer -Quick or -TestFileSizeMB to keep the flush small.'
+    }
+    else {
+        $notes += 'Writing test files grows the dynamic profile VHD(X); it shrinks on the share only after compaction.'
+    }
+    return $notes
+}
+
 function Initialize-AvdNativeMethod {
     [CmdletBinding()]
     param()
-    if ($null -eq ('AvdStorageBenchmark.NativeMethods' -as [type])) {
-        # GetVolumePathNameW / GetDiskFreeSpaceExW (fileapi.h, Microsoft Learn).
-        # Both resolve volume mount points, unlike DriveInfo which needs a drive root.
-        Add-Type -Namespace 'AvdStorageBenchmark' -Name 'NativeMethods' -MemberDefinition @'
+    if ($null -eq ('AvdStorageBenchmark.VolumeApi' -as [type])) {
+        # fileapi.h (Microsoft Learn): GetVolumePathNameW, GetDiskFreeSpaceExW,
+        # CreateFileW and GetFinalPathNameByHandleW. GetVolumePathName works on
+        # the path string and stops at C:\ for a profile redirected through a
+        # reparse point; GetFinalPathNameByHandle resolves the opened directory
+        # to the volume that really holds it.
+        Add-Type -Namespace 'AvdStorageBenchmark' -Name 'VolumeApi' -MemberDefinition @'
 [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
 [return: MarshalAs(UnmanagedType.Bool)]
 public static extern bool GetVolumePathNameW(string lpszFileName, System.Text.StringBuilder lpszVolumePathName, uint cchBufferLength);
 [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
 [return: MarshalAs(UnmanagedType.Bool)]
 public static extern bool GetDiskFreeSpaceExW(string lpDirectoryName, out ulong lpFreeBytesAvailable, out ulong lpTotalNumberOfBytes, out ulong lpTotalNumberOfFreeBytes);
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle hFile, System.Text.StringBuilder lpszFilePath, uint cchFilePath, uint dwFlags);
 '@
     }
 }
@@ -795,12 +872,43 @@ function Get-AvdExistingAncestor {
     return $current
 }
 
+function Get-AvdFinalNtPath {
+    <#
+    .SYNOPSIS
+        Opens a directory (read attributes only) and returns its final NT
+        path, following junctions, symbolic links and mount points.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)] [string] $Directory)
+    Initialize-AvdNativeMethod
+    $FILE_READ_ATTRIBUTES = [uint32]0x80
+    $FILE_SHARE_ALL = [uint32]0x7            # read | write | delete
+    $OPEN_EXISTING = [uint32]3
+    $FILE_FLAG_BACKUP_SEMANTICS = [uint32]0x02000000   # required to open a directory
+    $VOLUME_NAME_NT = [uint32]0x2
+    $handle = [AvdStorageBenchmark.VolumeApi]::CreateFileW($Directory, $FILE_READ_ATTRIBUTES, $FILE_SHARE_ALL, [IntPtr]::Zero, $OPEN_EXISTING, $FILE_FLAG_BACKUP_SEMANTICS, [IntPtr]::Zero)
+    if ($handle.IsInvalid) { throw "CreateFile failed for '$Directory' (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))." }
+    try {
+        $buffer = New-Object System.Text.StringBuilder 1024
+        $length = [AvdStorageBenchmark.VolumeApi]::GetFinalPathNameByHandleW($handle, $buffer, [uint32]$buffer.Capacity, $VOLUME_NAME_NT)
+        if ($length -ge $buffer.Capacity) {
+            $buffer = New-Object System.Text.StringBuilder ([int]$length + 1)
+            $length = [AvdStorageBenchmark.VolumeApi]::GetFinalPathNameByHandleW($handle, $buffer, [uint32]$buffer.Capacity, $VOLUME_NAME_NT)
+        }
+        if ($length -eq 0) { throw "GetFinalPathNameByHandle failed for '$Directory' (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))." }
+        return $buffer.ToString()
+    }
+    finally { $handle.Dispose() }
+}
+
 function Get-AvdVolumeInfo {
     <#
     .SYNOPSIS
-        Returns the volume mount point and free space for a path (or its
-        nearest existing parent). An FSLogix profile mounted from a VHDX
-        resolves to a different volume root than the OS disk.
+        Returns the volume identity and free space for a path (or its nearest
+        existing parent). VolumeDevice comes from the resolved final path, so
+        an FSLogix profile attached from a VHD(X) reports the container volume
+        even though its path starts with C:\.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -809,18 +917,54 @@ function Get-AvdVolumeInfo {
     $existing = Get-AvdExistingAncestor -Path $Path
     $probe = $existing.TrimEnd('\') + '\'
     $buffer = New-Object System.Text.StringBuilder 1024
-    if (-not [AvdStorageBenchmark.NativeMethods]::GetVolumePathNameW($probe, $buffer, [uint32]$buffer.Capacity)) {
+    if (-not [AvdStorageBenchmark.VolumeApi]::GetVolumePathNameW($probe, $buffer, [uint32]$buffer.Capacity)) {
         throw "GetVolumePathName failed for '$probe' (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))."
     }
+    $finalPath = $null; $device = $null
+    try {
+        $finalPath = Get-AvdFinalNtPath -Directory $existing
+        $device = Get-AvdVolumeDeviceFromNtPath -NtPath $finalPath
+    }
+    catch { Write-Warning "Could not resolve the final volume of '$existing': $($_.Exception.Message)" }
+    # GetDiskFreeSpaceEx operates on the target of a symbolic link (Microsoft Learn), so
+    # free space is reported for the volume that really holds the directory.
     $free = [uint64]0; $total = [uint64]0; $totalFree = [uint64]0
-    if (-not [AvdStorageBenchmark.NativeMethods]::GetDiskFreeSpaceExW($probe, [ref]$free, [ref]$total, [ref]$totalFree)) {
+    if (-not [AvdStorageBenchmark.VolumeApi]::GetDiskFreeSpaceExW($probe, [ref]$free, [ref]$total, [ref]$totalFree)) {
         throw "GetDiskFreeSpaceEx failed for '$probe' (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))."
     }
     [pscustomobject]@{
         Path           = $Path
         ExistingParent = $existing
         VolumeRoot     = $buffer.ToString()
+        FinalPath      = $finalPath
+        VolumeDevice   = $device
         FreeBytes      = [long]$free
         TotalBytes     = [long]$total
     }
+}
+
+function Test-AvdSameVolume {
+    <#
+    .SYNOPSIS
+        Decides whether two Get-AvdVolumeInfo results are on the same volume.
+
+    .DESCRIPTION
+        Two independent signals: the resolved volume device (final path) and
+        the volume capacity reported by GetDiskFreeSpaceEx. Either one
+        differing means different volumes; this stays correct whether FSLogix
+        reaches the container through a reparse point or through its filter
+        driver. With neither device known, the path-string root is compared.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)] [pscustomobject] $First, [Parameter(Mandatory)] [pscustomobject] $Second)
+    if ($First.VolumeDevice -and $Second.VolumeDevice -and
+        -not [string]::Equals($First.VolumeDevice, $Second.VolumeDevice, [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    if ($First.TotalBytes -gt 0 -and $Second.TotalBytes -gt 0 -and $First.TotalBytes -ne $Second.TotalBytes) {
+        return $false
+    }
+    if ($First.VolumeDevice -and $Second.VolumeDevice) { return $true }
+    return [string]::Equals($First.VolumeRoot, $Second.VolumeRoot, [StringComparison]::OrdinalIgnoreCase)
 }

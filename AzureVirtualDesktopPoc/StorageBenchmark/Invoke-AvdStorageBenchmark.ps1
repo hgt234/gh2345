@@ -171,6 +171,11 @@
 .NOTES
     - Run in the target user's session (not as SYSTEM) so %USERPROFILE% is the
       mounted FSLogix container. Elevation is not required.
+    - FSLogix Cloud Cache: the session runs from a local cache VHD(X) in
+      CacheDirectory (default C:\ProgramData\FSLogix\Cache, on the OS disk)
+      and writes flush asynchronously to the CCDLocations providers. The
+      Profile target then measures the local cache path plus flush overhead;
+      sign-out waits for the flush, so keep test data small (-Quick).
     - Writing test files into a dynamically expanding profile VHD(X) grows it.
       Deleting the files frees space inside the container, but the VHD(X) file
       on the share only shrinks when the container is compacted.
@@ -367,6 +372,38 @@ if ($Mode -eq 'Capture') {
 }
 #endregion
 
+function Get-AvdFslogixState {
+    <#
+    .SYNOPSIS
+        Reads FSLogix profile settings (Microsoft Learn, FSLogix configuration
+        settings): Enabled and CCDLocations under HKLM\SOFTWARE\FSLogix\Profiles,
+        CacheDirectory under HKLM\SYSTEM\CurrentControlSet\Services\frxccd\Parameters
+        (default C:\ProgramData\FSLogix\Cache). Uses the 64-bit registry view
+        so a 32-bit host is not redirected to WOW6432Node. CCDLocations is
+        reduced to provider type counts; share paths are not kept.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param()
+    $enabled = $null; $ccd = $null; $cacheDirectory = $null
+    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $profilesKey = $baseKey.OpenSubKey('SOFTWARE\FSLogix\Profiles')
+        if ($profilesKey) {
+            try { $enabled = $profilesKey.GetValue('Enabled'); $ccd = $profilesKey.GetValue('CCDLocations') } finally { $profilesKey.Dispose() }
+        }
+        $ccdKey = $baseKey.OpenSubKey('SYSTEM\CurrentControlSet\Services\frxccd\Parameters')
+        if ($ccdKey) {
+            try { $cacheDirectory = $ccdKey.GetValue('CacheDirectory') } finally { $ccdKey.Dispose() }
+        }
+    }
+    finally { $baseKey.Dispose() }
+    $cloudCache = Get-AvdCloudCacheProviderSummary -CcdLocations $ccd
+    if ($cloudCache.Configured -and -not $cacheDirectory) { $cacheDirectory = 'C:\ProgramData\FSLogix\Cache' }
+    if ($cacheDirectory) { $cacheDirectory = [Environment]::ExpandEnvironmentVariables([string]$cacheDirectory) }
+    [pscustomobject]@{ Enabled = $enabled; CloudCache = $cloudCache; CacheDirectory = [string]$cacheDirectory }
+}
+
 #region Targets (read-only discovery)
 if (-not $PSBoundParameters.ContainsKey('Target')) {
     $Target = @('OsDisk', 'Profile')
@@ -385,25 +422,29 @@ $targets = foreach ($name in ($Target | Select-Object -Unique)) {
     if ($volume.FreeBytes -lt $needed) {
         throw ("Target {0} ({1}): {2:N1} GiB free on {3}, need {4:N1} GiB (test files {5:N1} GiB + MinimumFreeSpaceGB)." -f $name, $directory, ($volume.FreeBytes / 1GB), $volume.VolumeRoot, ($needed / 1GB), ($requiredBytes / 1GB))
     }
+    $fslogix = $null
     if ($name -eq 'Profile') {
-        # Read the 64-bit view explicitly so a 32-bit host is not redirected to WOW6432Node.
-        $fslogixEnabled = $null
-        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
-        try {
-            $key = $baseKey.OpenSubKey('SOFTWARE\FSLogix\Profiles')
-            if ($key) { try { $fslogixEnabled = $key.GetValue('Enabled') } finally { $key.Dispose() } }
+        $fslogixState = Get-AvdFslogixState
+        $cacheOnOs = $true
+        if ($fslogixState.CloudCache.Configured -and $fslogixState.CacheDirectory) {
+            try { $cacheOnOs = Test-AvdSameVolume -First (Get-AvdVolumeInfo -Path $fslogixState.CacheDirectory) -Second $osVolume }
+            catch { Write-Verbose "Could not resolve the Cloud Cache directory volume: $($_.Exception.Message)" }
         }
-        finally { $baseKey.Dispose() }
-        if ($fslogixEnabled -ne 1) { $notes += 'FSLogix Profiles is not enabled (HKLM\SOFTWARE\FSLogix\Profiles\Enabled is not 1).' }
-        if ($volume.VolumeRoot -eq $osVolume.VolumeRoot) { $notes += "Profile path resolves to the OS volume ($($volume.VolumeRoot)); no profile container appears to be mounted, so this measures the OS disk." }
-        else { $notes += "Writing test files grows the dynamic profile VHD(X); it shrinks on the share only after compaction." }
+        $notes += Get-AvdProfileStorageNote -FslogixEnabled $fslogixState.Enabled -ProfileOnOsVolume (Test-AvdSameVolume -First $volume -Second $osVolume) `
+            -CloudCache $fslogixState.CloudCache -CacheDirectory $fslogixState.CacheDirectory -CacheOnOsVolume $cacheOnOs
+        $fslogix = [pscustomobject]@{
+            Enabled = $fslogixState.Enabled; CloudCache = $fslogixState.CloudCache.Configured
+            CloudCacheProviders = [pscustomobject]@{ Smb = $fslogixState.CloudCache.Smb; Azure = $fslogixState.CloudCache.Azure }
+            CacheDirectory = $fslogixState.CacheDirectory; CacheOnOsVolume = $cacheOnOs
+        }
     }
-    if ($name -eq 'DataDisk' -and $volume.VolumeRoot -eq $osVolume.VolumeRoot) {
+    if ($name -eq 'DataDisk' -and (Test-AvdSameVolume -First $volume -Second $osVolume)) {
         $notes += "Data disk path resolves to the OS volume ($($volume.VolumeRoot))."
     }
     foreach ($note in $notes) { Write-Warning "${name}: $note" }
     [pscustomobject]@{
-        Name = $name; Directory = $directory; VolumeRoot = $volume.VolumeRoot
+        Name = $name; Directory = $directory; VolumeRoot = $volume.VolumeRoot; VolumeDevice = $volume.VolumeDevice
+        OnOsVolume = (Test-AvdSameVolume -First $volume -Second $osVolume); FSLogix = $fslogix
         FreeGiB = [math]::Round($volume.FreeBytes / 1GB, 1); TotalGiB = [math]::Round($volume.TotalBytes / 1GB, 1); Notes = $notes
     }
 }
@@ -477,7 +518,10 @@ else {
 #region WhatIf summary
 if ($WhatIfPreference) {
     foreach ($t in $targets) {
-        Write-AvdStatus ("What if: target {0} -> {1} (volume {2}, {3} GiB free). Would create {4:N1} GiB of test files: {5}" -f $t.Name, $t.Directory, $t.VolumeRoot, $t.FreeGiB, ($requiredBytes / 1GB), (($workload.Files | ForEach-Object { "$($_.Name).dat $($_.SizeMB) MiB" }) -join ', '))
+        $volumeLabel = $t.VolumeRoot
+        if ($t.VolumeDevice) { $volumeLabel = $t.VolumeDevice }
+        if ($t.OnOsVolume) { $volumeLabel += ', OS volume' } else { $volumeLabel += ', separate volume' }
+        Write-AvdStatus ("What if: target {0} -> {1} ({2}, {3} GiB free). Would create {4:N1} GiB of test files: {5}" -f $t.Name, $t.Directory, $volumeLabel, $t.FreeGiB, ($requiredBytes / 1GB), (($workload.Files | ForEach-Object { "$($_.Name).dat $($_.SizeMB) MiB" }) -join ', '))
     }
     Write-AvdStatus ("What if: would run {0} DiskSpd processes over about {1:N0} minutes and record {2} counters into {3}." -f $plan.Count, ($estimatedSeconds / 60), @($counterSelection.Selected).Count, $runDirectory)
     $plan | Select-Object Target, Scenario, Stream, BlockSizeKiB, Pattern, HotSpot, WritePercent, Threads, QueueDepth, IopsLimitPerThread, CommandLine

@@ -109,6 +109,17 @@ Results contain the computer name; do not commit them.
 - `-CacheMode Unbuffered` (default) bypasses the Windows cache to measure the
   storage path. Real Visual Studio IO is cached, so users see better read
   latency for hot files.
+- **FSLogix Cloud Cache** (`CCDLocations` set): the session runs from a local
+  cache VHD(X) in `CacheDirectory` (default `C:\ProgramData\FSLogix\Cache`, on
+  the OS disk). Reads come from the local cache (missing data is hydrated from
+  the first provider) and writes flush asynchronously to every provider. The
+  Profile target therefore measures the local cache on the OS disk plus the
+  VHD(X) layer and flush overhead, not the remote share. Sign-out waits until
+  the providers have the test data, so prefer `-Quick` or a small `-TestFileSizeMB`.
+  The script detects Cloud Cache and reports provider types only (no share paths).
+- The profile volume is identified by resolving the opened directory
+  (`GetFinalPathNameByHandle`) and by volume capacity, because the profile path
+  still starts with `C:\Users\...` when the container is attached.
 - The test writes 2.5 GiB per target. Inside a dynamically expanding profile
   VHD(X) this grows the container; the files are deleted afterwards, but the
   VHD(X) on the share only shrinks on compaction.
