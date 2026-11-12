@@ -821,7 +821,7 @@ function Get-AvdProfileStorageNote {
     $notes = @()
     if ($FslogixEnabled -ne 1) { $notes += 'FSLogix Profiles is not enabled (HKLM\SOFTWARE\FSLogix\Profiles\Enabled is not 1).' }
     if ($ProfileOnOsVolume) {
-        $notes += 'Profile path resolves to the OS volume; no profile container is attached for this user, so this target measures the OS disk.'
+        $notes += 'No FSLogix container is attached for this user (no FSLogix session key, and the profile path resolves to the OS volume), so this target measures the OS disk.'
         return $notes
     }
     if ($CloudCache.Configured) {
@@ -834,6 +834,55 @@ function Get-AvdProfileStorageNote {
         $notes += 'Writing test files grows the dynamic profile VHD(X); it shrinks on the share only after compaction.'
     }
     return $notes
+}
+
+function Resolve-AvdProfileAttachment {
+    <#
+    .SYNOPSIS
+        Decides whether the user's FSLogix container is attached and where.
+
+    .DESCRIPTION
+        FSLogix redirects C:\Users\<user> with its filter driver (no reparse
+        point or mount point), so path and volume APIs report the OS volume.
+        The primary signal is FSLogix's per-session key
+        HKLM\SOFTWARE\FSLogix\Profiles\Sessions\<SID> and its Volume value
+        (\\?\Volume{GUID}\). That key is not in the Microsoft Learn reference;
+        it is used by community tooling and is treated as best effort, with the
+        volume probe as fallback.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)] [bool] $SessionFound,
+        [AllowEmptyString()] [AllowNull()] [string] $SessionVolume,
+        [Parameter(Mandatory)] [bool] $ProbeOnOsVolume
+    )
+    if ($SessionVolume -match '^\\\\\?\\Volume\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}\\$') {
+        return [pscustomobject]@{ Attached = $true; Source = 'FSLogixSession'; VolumeGuidPath = $SessionVolume }
+    }
+    if ($SessionFound) {
+        return [pscustomobject]@{ Attached = $true; Source = 'FSLogixSessionNoVolume'; VolumeGuidPath = $null }
+    }
+    if (-not $ProbeOnOsVolume) {
+        return [pscustomobject]@{ Attached = $true; Source = 'VolumeProbe'; VolumeGuidPath = $null }
+    }
+    return [pscustomobject]@{ Attached = $false; Source = 'None'; VolumeGuidPath = $null }
+}
+
+function Get-AvdVolumeSpace {
+    <#
+    .SYNOPSIS
+        Free and total bytes for a volume root such as \\?\Volume{GUID}\.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([Parameter(Mandatory)] [string] $RootPath)
+    Initialize-AvdNativeMethod
+    $free = [uint64]0; $total = [uint64]0; $totalFree = [uint64]0
+    if (-not [AvdStorageBenchmark.VolumeApi]::GetDiskFreeSpaceExW($RootPath, [ref]$free, [ref]$total, [ref]$totalFree)) {
+        throw "GetDiskFreeSpaceEx failed for '$RootPath' (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))."
+    }
+    [pscustomobject]@{ FreeBytes = [long]$free; TotalBytes = [long]$total }
 }
 
 function Initialize-AvdNativeMethod {

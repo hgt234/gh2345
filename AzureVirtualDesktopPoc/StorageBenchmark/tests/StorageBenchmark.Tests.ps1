@@ -514,18 +514,44 @@ Describe 'Cloud Cache detection' {
         $notes = @(Get-AvdProfileStorageNote -FslogixEnabled 1 -ProfileOnOsVolume $false -CloudCache $cc -CacheDirectory 'C:\ProgramData\FSLogix\Cache' -CacheOnOsVolume $true)
         $notes[0] | Should -BeLike "Cloud Cache: *local cache in 'C:\ProgramData\FSLogix\Cache' (on the OS disk)*1 provider(s)*"
         $notes[1] | Should -BeLike '*sign-out waits*'
-        @($notes | Where-Object { $_ -like '*no profile container*' }).Count | Should -Be 0
+        @($notes | Where-Object { $_ -like '*No FSLogix container*' }).Count | Should -Be 0
     }
 
     It 'warns only when the profile really is on the OS volume' {
         $none = Get-AvdCloudCacheProviderSummary -CcdLocations $null
         $notes = @(Get-AvdProfileStorageNote -FslogixEnabled 1 -ProfileOnOsVolume $true -CloudCache $none)
         $notes.Count | Should -Be 1
-        $notes[0] | Should -BeLike '*no profile container is attached*'
+        $notes[0] | Should -BeLike '*No FSLogix container is attached*'
     }
 
     It 'notes VHD growth for a classic VHDLocations container' {
         $none = Get-AvdCloudCacheProviderSummary -CcdLocations $null
         @(Get-AvdProfileStorageNote -FslogixEnabled 1 -ProfileOnOsVolume $false -CloudCache $none)[0] | Should -BeLike '*grows the dynamic profile VHD(X)*'
+    }
+}
+
+Describe 'Resolve-AvdProfileAttachment (FSLogix filter-driver redirection)' {
+    It 'uses the FSLogix session Volume even though the path probe says OS volume (regression)' {
+        $r = Resolve-AvdProfileAttachment -SessionFound $true -SessionVolume '\\?\Volume{11111111-1111-1111-1111-111111111111}\' -ProbeOnOsVolume $true
+        $r.Attached | Should -BeTrue
+        $r.Source | Should -Be 'FSLogixSession'
+        $r.VolumeGuidPath | Should -Be '\\?\Volume{11111111-1111-1111-1111-111111111111}\'
+    }
+
+    It 'treats a session key without a usable Volume as attached, volume unknown' {
+        $r = Resolve-AvdProfileAttachment -SessionFound $true -SessionVolume 'not-a-volume' -ProbeOnOsVolume $true
+        $r.Attached | Should -BeTrue
+        $r.Source | Should -Be 'FSLogixSessionNoVolume'
+        $r.VolumeGuidPath | Should -BeNullOrEmpty
+    }
+
+    It 'falls back to the volume probe without a session key' {
+        (Resolve-AvdProfileAttachment -SessionFound $false -SessionVolume $null -ProbeOnOsVolume $false).Source | Should -Be 'VolumeProbe'
+    }
+
+    It 'reports not attached when there is no session key and the probe says OS volume' {
+        $r = Resolve-AvdProfileAttachment -SessionFound $false -SessionVolume '' -ProbeOnOsVolume $true
+        $r.Attached | Should -BeFalse
+        $r.Source | Should -Be 'None'
     }
 }

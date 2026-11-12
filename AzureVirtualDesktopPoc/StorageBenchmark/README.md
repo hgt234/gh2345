@@ -117,9 +117,13 @@ Results contain the computer name; do not commit them.
   VHD(X) layer and flush overhead, not the remote share. Sign-out waits until
   the providers have the test data, so prefer `-Quick` or a small `-TestFileSizeMB`.
   The script detects Cloud Cache and reports provider types only (no share paths).
-- The profile volume is identified by resolving the opened directory
-  (`GetFinalPathNameByHandle`) and by volume capacity, because the profile path
-  still starts with `C:\Users\...` when the container is attached.
+- FSLogix redirects `C:\Users\<user>` with its filter driver (no reparse point
+  or mount point), so Windows path and volume APIs report the OS volume. The
+  script detects the attached container from FSLogix's per-session key
+  `HKLM\SOFTWARE\FSLogix\Profiles\Sessions\<SID>` (`Volume` value) and reads
+  free space from that volume. This key is used by community tooling but is
+  not in the Microsoft Learn reference; without it the script falls back to a
+  volume probe. `report.json` records which signal was used (`FSLogix.Detection`).
 - The test writes 2.5 GiB per target. Inside a dynamically expanding profile
   VHD(X) this grows the container; the files are deleted afterwards, but the
   VHD(X) on the share only shrinks on compaction.

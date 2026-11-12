@@ -385,13 +385,23 @@ function Get-AvdFslogixState {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param()
-    $enabled = $null; $ccd = $null; $cacheDirectory = $null
+    $enabled = $null; $ccd = $null; $cacheDirectory = $null; $sessionFound = $false; $sessionVolume = $null
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
     try {
         $profilesKey = $baseKey.OpenSubKey('SOFTWARE\FSLogix\Profiles')
         if ($profilesKey) {
             try { $enabled = $profilesKey.GetValue('Enabled'); $ccd = $profilesKey.GetValue('CCDLocations') } finally { $profilesKey.Dispose() }
         }
+        # Per-session state (community-documented, not in the Learn reference).
+        # Only the Volume value is read; other values can contain user and share names.
+        try {
+            $sessionKey = $baseKey.OpenSubKey("SOFTWARE\FSLogix\Profiles\Sessions\$sid")
+            if ($sessionKey) {
+                try { $sessionFound = $true; $sessionVolume = [string]$sessionKey.GetValue('Volume') } finally { $sessionKey.Dispose() }
+            }
+        }
+        catch { Write-Verbose "Could not read the FSLogix session key: $($_.Exception.Message)" }
         $ccdKey = $baseKey.OpenSubKey('SYSTEM\CurrentControlSet\Services\frxccd\Parameters')
         if ($ccdKey) {
             try { $cacheDirectory = $ccdKey.GetValue('CacheDirectory') } finally { $ccdKey.Dispose() }
@@ -401,7 +411,7 @@ function Get-AvdFslogixState {
     $cloudCache = Get-AvdCloudCacheProviderSummary -CcdLocations $ccd
     if ($cloudCache.Configured -and -not $cacheDirectory) { $cacheDirectory = 'C:\ProgramData\FSLogix\Cache' }
     if ($cacheDirectory) { $cacheDirectory = [Environment]::ExpandEnvironmentVariables([string]$cacheDirectory) }
-    [pscustomobject]@{ Enabled = $enabled; CloudCache = $cloudCache; CacheDirectory = [string]$cacheDirectory }
+    [pscustomobject]@{ Enabled = $enabled; CloudCache = $cloudCache; CacheDirectory = [string]$cacheDirectory; SessionFound = $sessionFound; SessionVolume = $sessionVolume }
 }
 
 #region Targets (read-only discovery)
@@ -417,35 +427,53 @@ $osVolume = Get-AvdVolumeInfo -Path $env:SystemDrive
 $targets = foreach ($name in ($Target | Select-Object -Unique)) {
     $directory = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($directories[$name])
     $volume = Get-AvdVolumeInfo -Path $directory
+    $onOsVolume = Test-AvdSameVolume -First $volume -Second $osVolume
+    $volumeLabel = $volume.VolumeRoot
+    if ($volume.VolumeDevice) { $volumeLabel = $volume.VolumeDevice }
+    $freeBytes = $volume.FreeBytes; $totalBytes = $volume.TotalBytes
     $notes = @()
-    $needed = $requiredBytes + ([long]$MinimumFreeSpaceGB * 1GB)
-    if ($volume.FreeBytes -lt $needed) {
-        throw ("Target {0} ({1}): {2:N1} GiB free on {3}, need {4:N1} GiB (test files {5:N1} GiB + MinimumFreeSpaceGB)." -f $name, $directory, ($volume.FreeBytes / 1GB), $volume.VolumeRoot, ($needed / 1GB), ($requiredBytes / 1GB))
-    }
     $fslogix = $null
     if ($name -eq 'Profile') {
         $fslogixState = Get-AvdFslogixState
+        $attachment = Resolve-AvdProfileAttachment -SessionFound $fslogixState.SessionFound -SessionVolume $fslogixState.SessionVolume -ProbeOnOsVolume $onOsVolume
+        $onOsVolume = -not $attachment.Attached
+        if ($attachment.VolumeGuidPath) {
+            # Free space must come from the container, not from C:.
+            try {
+                $space = Get-AvdVolumeSpace -RootPath $attachment.VolumeGuidPath
+                $freeBytes = $space.FreeBytes; $totalBytes = $space.TotalBytes; $volumeLabel = $attachment.VolumeGuidPath
+            }
+            catch { $notes += "Could not read free space of the container volume; the value shown may be the OS disk's. $($_.Exception.Message)" }
+        }
+        elseif ($attachment.Attached) {
+            $notes += "Container detected via $($attachment.Source), but its volume is unknown; the free space shown may be the OS disk's, not the container's (SizeInMBs)."
+        }
         $cacheOnOs = $true
         if ($fslogixState.CloudCache.Configured -and $fslogixState.CacheDirectory) {
             try { $cacheOnOs = Test-AvdSameVolume -First (Get-AvdVolumeInfo -Path $fslogixState.CacheDirectory) -Second $osVolume }
             catch { Write-Verbose "Could not resolve the Cloud Cache directory volume: $($_.Exception.Message)" }
         }
-        $notes += Get-AvdProfileStorageNote -FslogixEnabled $fslogixState.Enabled -ProfileOnOsVolume (Test-AvdSameVolume -First $volume -Second $osVolume) `
+        $notes += Get-AvdProfileStorageNote -FslogixEnabled $fslogixState.Enabled -ProfileOnOsVolume $onOsVolume `
             -CloudCache $fslogixState.CloudCache -CacheDirectory $fslogixState.CacheDirectory -CacheOnOsVolume $cacheOnOs
         $fslogix = [pscustomobject]@{
-            Enabled = $fslogixState.Enabled; CloudCache = $fslogixState.CloudCache.Configured
+            Enabled = $fslogixState.Enabled; Attached = $attachment.Attached; Detection = $attachment.Source
+            CloudCache = $fslogixState.CloudCache.Configured
             CloudCacheProviders = [pscustomobject]@{ Smb = $fslogixState.CloudCache.Smb; Azure = $fslogixState.CloudCache.Azure }
             CacheDirectory = $fslogixState.CacheDirectory; CacheOnOsVolume = $cacheOnOs
         }
     }
-    if ($name -eq 'DataDisk' -and (Test-AvdSameVolume -First $volume -Second $osVolume)) {
+    if ($name -eq 'DataDisk' -and $onOsVolume) {
         $notes += "Data disk path resolves to the OS volume ($($volume.VolumeRoot))."
+    }
+    $needed = $requiredBytes + ([long]$MinimumFreeSpaceGB * 1GB)
+    if ($freeBytes -lt $needed) {
+        throw ("Target {0} ({1}): {2:N1} GiB free on {3}, need {4:N1} GiB (test files {5:N1} GiB + MinimumFreeSpaceGB)." -f $name, $directory, ($freeBytes / 1GB), $volumeLabel, ($needed / 1GB), ($requiredBytes / 1GB))
     }
     foreach ($note in $notes) { Write-Warning "${name}: $note" }
     [pscustomobject]@{
         Name = $name; Directory = $directory; VolumeRoot = $volume.VolumeRoot; VolumeDevice = $volume.VolumeDevice
-        OnOsVolume = (Test-AvdSameVolume -First $volume -Second $osVolume); FSLogix = $fslogix
-        FreeGiB = [math]::Round($volume.FreeBytes / 1GB, 1); TotalGiB = [math]::Round($volume.TotalBytes / 1GB, 1); Notes = $notes
+        VolumeLabel = $volumeLabel; OnOsVolume = $onOsVolume; FSLogix = $fslogix
+        FreeGiB = [math]::Round($freeBytes / 1GB, 1); TotalGiB = [math]::Round($totalBytes / 1GB, 1); Notes = $notes
     }
 }
 $targets = @($targets)
@@ -518,8 +546,7 @@ else {
 #region WhatIf summary
 if ($WhatIfPreference) {
     foreach ($t in $targets) {
-        $volumeLabel = $t.VolumeRoot
-        if ($t.VolumeDevice) { $volumeLabel = $t.VolumeDevice }
+        $volumeLabel = $t.VolumeLabel
         if ($t.OnOsVolume) { $volumeLabel += ', OS volume' } else { $volumeLabel += ', separate volume' }
         Write-AvdStatus ("What if: target {0} -> {1} ({2}, {3} GiB free). Would create {4:N1} GiB of test files: {5}" -f $t.Name, $t.Directory, $volumeLabel, $t.FreeGiB, ($requiredBytes / 1GB), (($workload.Files | ForEach-Object { "$($_.Name).dat $($_.SizeMB) MiB" }) -join ', '))
     }
