@@ -1,0 +1,35 @@
+# Local assistant files
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+
+# Local editor settings
+.vscode/
+
+# Holds the real Azure DevOps organization and project names
+technician/Start-AvdBuild.settings.json
+
+# Real variable-group files; only the *.example.yml templates are tracked
+*.variables.yml
+!*.variables.example.yml
+
+# Run output that can contain tenant, subscription, device, or user identifiers
+avd-readiness*.json
+readiness*.json
+session-host-what-if*.json
+*.parameters.json
+pester-results.xml
+.tmp/
+
+# Secrets and credentials
+.env
+.env.*
+*.env
+*.pfx
+*.p12
+*.pem
+*.key
+*.secret
+*.secrets
+*secrets*.json
+*credential*.json

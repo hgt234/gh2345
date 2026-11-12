@@ -1,0 +1,414 @@
+# Production build of one Azure-hosted personal AVD desktop into existing
+# infrastructure. One pipeline serves both request sources:
+#   - ServiceNow queues it with ritmNumber, ritmSysId, requestedHostName, and
+#     requestedForUpn; supplying ritmSysId enables the RITM status callbacks.
+#   - A technician starts it from the Run pipeline panel (or Start-AvdBuild.ps1)
+#     with workload, ritmNumber, and requestedForUpn, leaving ritmSysId blank;
+#     no ServiceNow variable group or callback is then used.
+# Networking, host pools, application groups, and workspaces are never created,
+# modified, or deleted. Only the VM, NIC, disk, extensions, registration token,
+# user role assignments, and the personal-host assignment are touched.
+name: ${{ parameters.ritmNumber }}-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+parameters:
+  - name: workload
+    displayName: Workload
+    type: string
+    # One entry per workload; each needs a variable group avd-prod-<entry>.
+    # ServiceNow omits this parameter, so the first value is the default.
+    default: example-workload
+    values:
+      - example-workload
+  - name: ritmNumber
+    displayName: RITM number (for example RITM0012345)
+    type: string
+  - name: requestedForUpn
+    displayName: Requested-for UPN (for example user@contoso.com)
+    type: string
+  - name: ritmSysId
+    displayName: ServiceNow RITM sys_id (leave blank for a technician-started build)
+    type: string
+    default: ''
+  - name: requestedHostName
+    displayName: ServiceNow-derived host name (leave blank for a technician-started build)
+    type: string
+    default: ''
+
+variables:
+  # The values list above restricts this to known workloads.
+  - group: avd-prod-${{ parameters.workload }}
+  - ${{ if ne(parameters.ritmSysId, '') }}:
+      - group: avd-prod-servicenow
+  - name: artifactDirectory
+    value: $(Build.ArtifactStagingDirectory)/avd-session-host
+
+stages:
+  - stage: ValidateRequest
+    displayName: Validate the request
+    jobs:
+      - job: Validate
+        pool:
+          vmImage: windows-latest
+        steps:
+          - task: PowerShell@2
+            name: request
+            displayName: Validate RITM, UPN, and sys_id; derive host name
+            env:
+              RITM_NUMBER: ${{ parameters.ritmNumber }}
+              REQUESTED_FOR_UPN: ${{ parameters.requestedForUpn }}
+              RITM_SYS_ID: ${{ parameters.ritmSysId }}
+              REQUESTED_HOST_NAME: ${{ parameters.requestedHostName }}
+            inputs:
+              pwsh: true
+              targetType: inline
+              script: |
+                & 'scripts/Test-AvdProvisionRequest.ps1' `
+                  -RitmNumber $env:RITM_NUMBER `
+                  -RequestedForUpn $env:REQUESTED_FOR_UPN `
+                  -RitmSysId $env:RITM_SYS_ID `
+                  -RequestedHostName $env:REQUESTED_HOST_NAME
+          - ${{ if ne(parameters.ritmSysId, '') }}:
+              - task: PowerShell@2
+                displayName: Mark ServiceNow request in progress
+                env:
+                  SN_INSTANCE_URL: $(SN_INSTANCE_URL)
+                  SN_CLIENT_ID: $(SN_CLIENT_ID)
+                  SN_CLIENT_SECRET: $(SN_CLIENT_SECRET)
+                  SN_USERNAME: $(SN_USERNAME)
+                  SN_PASSWORD: $(SN_PASSWORD)
+                  RITM_SYS_ID: $(request.ritmSysId)
+                  HOST_NAME: $(request.hostName)
+                  STATUS_FIELD: $(SN_STATUS_FIELD)
+                  HOST_NAME_FIELD: $(SN_HOSTNAME_FIELD)
+                inputs:
+                  pwsh: true
+                  targetType: inline
+                  script: |
+                    & 'scripts/Update-ServiceNowRitm.ps1' `
+                      -InstanceUrl $env:SN_INSTANCE_URL `
+                      -ClientId $env:SN_CLIENT_ID `
+                      -ClientSecret $env:SN_CLIENT_SECRET `
+                      -UserName $env:SN_USERNAME `
+                      -Password $env:SN_PASSWORD `
+                      -RitmSysId $env:RITM_SYS_ID `
+                      -Status 'In Progress' `
+                      -HostName $env:HOST_NAME `
+                      -StatusField $env:STATUS_FIELD `
+                      -HostNameField $env:HOST_NAME_FIELD `
+                      -Message "Azure DevOps build $(Build.BuildId) accepted the request and began provisioning."
+
+  # Every later stage lists ValidateRequest in dependsOn because stageDependencies
+  # can only read stages named there. They use these validated outputs, not the
+  # raw parameters.
+  - stage: Provision
+    displayName: Deploy private Windows 11 session host
+    dependsOn: ValidateRequest
+    condition: succeeded()
+    variables:
+      ritmNumber: $[ stageDependencies.ValidateRequest.Validate.outputs['request.ritmNumber'] ]
+      hostName: $[ stageDependencies.ValidateRequest.Validate.outputs['request.hostName'] ]
+      requestedForUpn: $[ stageDependencies.ValidateRequest.Validate.outputs['request.requestedForUpn'] ]
+    jobs:
+      - job: DeployVm
+        timeoutInMinutes: 45
+        pool:
+          vmImage: windows-latest
+        steps:
+          - task: AzureCLI@2
+            name: deployment
+            displayName: What-if and additive VM deployment
+            env:
+              SUBSCRIPTION_ID: $(AVD_SUBSCRIPTION_ID)
+              TENANT_ID: $(AVD_TENANT_ID)
+              RESOURCE_GROUP: $(AVD_SESSION_HOST_RESOURCE_GROUP)
+              PLATFORM_RESOURCE_GROUP: $(AVD_PLATFORM_RESOURCE_GROUP)
+              HOST_POOL_NAME: $(AVD_HOST_POOL_NAME)
+              SUBNET_ID: $(AVD_SESSION_HOST_SUBNET_ID)
+              VM_NAME: $(hostName)
+              RITM_NUMBER: $(ritmNumber)
+              REQUESTED_FOR_UPN: $(requestedForUpn)
+              ENVIRONMENT_NAME: $(AVD_ENVIRONMENT_NAME)
+              LOCATION: $(AVD_LOCATION)
+              VM_SIZE: $(AVD_VM_SIZE)
+              OS_DISK_SKU: $(AVD_OS_DISK_SKU)
+              IMAGE_SOURCE_TYPE: $(AVD_IMAGE_SOURCE_TYPE)
+              GALLERY_IMAGE_DEFINITION_ID: $(AVD_GALLERY_IMAGE_DEFINITION_ID)
+              GALLERY_IMAGE_VERSION_ID: $(AVD_GALLERY_IMAGE_VERSION_ID)
+              AVD_DSC_URI: $(AVD_DSC_CONFIGURATION_URI)
+            inputs:
+              azureSubscription: $(AVD_DEPLOYMENT_SERVICE_CONNECTION)
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $ErrorActionPreference = 'Stop'
+                New-Item -ItemType Directory -Path '$(artifactDirectory)' -Force | Out-Null
+                & 'scripts/New-AvdSessionHost.ps1' `
+                  -SubscriptionId $env:SUBSCRIPTION_ID `
+                  -TenantId $env:TENANT_ID `
+                  -ResourceGroupName $env:RESOURCE_GROUP `
+                  -PlatformResourceGroupName $env:PLATFORM_RESOURCE_GROUP `
+                  -HostPoolName $env:HOST_POOL_NAME `
+                  -SubnetId $env:SUBNET_ID `
+                  -VmName $env:VM_NAME `
+                  -RitmNumber $env:RITM_NUMBER `
+                  -RequestedForUpn $env:REQUESTED_FOR_UPN `
+                  -EnvironmentName $env:ENVIRONMENT_NAME `
+                  -Location $env:LOCATION `
+                  -VmSize $env:VM_SIZE `
+                  -OsDiskSku $env:OS_DISK_SKU `
+                  -ImageSourceType $env:IMAGE_SOURCE_TYPE `
+                  -GalleryImageDefinitionId $env:GALLERY_IMAGE_DEFINITION_ID `
+                  -GalleryImageVersionId $env:GALLERY_IMAGE_VERSION_ID `
+                  -AvdDscConfigurationUri $env:AVD_DSC_URI `
+                  -TemplateFile 'infra/session-host.bicep' `
+                  -WhatIfReportPath '$(artifactDirectory)/session-host-what-if.json'
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: $(artifactDirectory)
+              artifact: avd-session-host-provision-$(hostName)
+
+  - stage: Readiness
+    displayName: Pre-flight checks for apps and readiness
+    dependsOn:
+      - ValidateRequest
+      - Provision
+    condition: succeeded()
+    variables:
+      hostName: $[ stageDependencies.ValidateRequest.Validate.outputs['request.hostName'] ]
+    jobs:
+      - job: ReadinessChecks
+        timeoutInMinutes: 140
+        pool:
+          vmImage: windows-latest
+        steps:
+          - task: AzureCLI@2
+            displayName: Check Azure, Entra, Intune, apps, and AVD
+            env:
+              REQUIRED_APP_NAMES: $(AVD_REQUIRED_APP_NAMES_JSON)
+              REQUIRE_INTUNE_ENROLLED: $(AVD_REQUIRE_INTUNE_ENROLLED)
+              REQUIRE_INTUNE_COMPLIANT: $(AVD_REQUIRE_INTUNE_COMPLIANT)
+              REQUIRE_MDE: $(AVD_REQUIRE_MDE)
+              SUBSCRIPTION_ID: $(AVD_SUBSCRIPTION_ID)
+              SESSION_HOST_RESOURCE_GROUP: $(AVD_SESSION_HOST_RESOURCE_GROUP)
+              PLATFORM_RESOURCE_GROUP: $(AVD_PLATFORM_RESOURCE_GROUP)
+              HOST_POOL_NAME: $(AVD_HOST_POOL_NAME)
+              VM_NAME: $(hostName)
+              READINESS_TIMEOUT: $(AVD_READINESS_TIMEOUT_MINUTES)
+            inputs:
+              azureSubscription: $(AVD_READINESS_SERVICE_CONNECTION)
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $ErrorActionPreference = 'Stop'
+                New-Item -ItemType Directory -Path '$(artifactDirectory)' -Force | Out-Null
+                $apps = @($env:REQUIRED_APP_NAMES | ConvertFrom-Json)
+                $arguments = @{
+                  SubscriptionId = $env:SUBSCRIPTION_ID
+                  SessionHostResourceGroupName = $env:SESSION_HOST_RESOURCE_GROUP
+                  PlatformResourceGroupName = $env:PLATFORM_RESOURCE_GROUP
+                  HostPoolName = $env:HOST_POOL_NAME
+                  VmName = $env:VM_NAME
+                  RequiredAppName = $apps
+                  TimeoutMinutes = [int]$env:READINESS_TIMEOUT
+                  ReportPath = '$(artifactDirectory)/readiness.json'
+                }
+                if ($env:REQUIRE_INTUNE_ENROLLED -ieq 'true') { $arguments.RequireIntuneEnrolled = $true }
+                if ($env:REQUIRE_INTUNE_COMPLIANT -ieq 'true') { $arguments.RequireIntuneCompliant = $true }
+                if ($env:REQUIRE_MDE -ieq 'true') { $arguments.RequireMde = $true }
+                & 'scripts/Wait-AvdReadiness.ps1' @arguments
+          - task: PowerShell@2
+            displayName: Report readiness back to the build
+            condition: always()
+            continueOnError: true
+            inputs:
+              pwsh: true
+              targetType: inline
+              script: |
+                $reportPath = '$(artifactDirectory)/readiness.json'
+                if (-not (Test-Path -LiteralPath $reportPath)) { return }
+                $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+                $lines = @(
+                  "# AVD readiness: $($report.vmName)",
+                  '',
+                  "Result: **$($report.result)**",
+                  '',
+                  '| Check | Passed |',
+                  '| --- | --- |'
+                )
+                foreach ($property in $report.checks.PSObject.Properties) {
+                  $lines += "| $($property.Name) | $($property.Value) |"
+                }
+                if (@($report.errors).Count -gt 0) {
+                  $lines += @('', 'Last poll errors:', '')
+                  foreach ($pollError in $report.errors) { $lines += "- $pollError" }
+                }
+                $summaryPath = '$(artifactDirectory)/readiness-summary.md'
+                $lines -join [Environment]::NewLine | Set-Content -LiteralPath $summaryPath -Encoding utf8
+                Write-Host "##vso[task.uploadsummary]$summaryPath"
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: $(artifactDirectory)
+              artifact: avd-session-host-readiness-$(hostName)
+
+  - stage: Assign
+    displayName: Assign the ready personal desktop
+    dependsOn:
+      - ValidateRequest
+      - Readiness
+    condition: succeeded()
+    variables:
+      hostName: $[ stageDependencies.ValidateRequest.Validate.outputs['request.hostName'] ]
+      requestedForUpn: $[ stageDependencies.ValidateRequest.Validate.outputs['request.requestedForUpn'] ]
+    jobs:
+      - job: AssignUser
+        pool:
+          vmImage: windows-latest
+        steps:
+          - task: AzureCLI@2
+            displayName: Grant access and bind the user to the session host
+            env:
+              SUBSCRIPTION_ID: $(AVD_SUBSCRIPTION_ID)
+              SESSION_HOST_RESOURCE_GROUP: $(AVD_SESSION_HOST_RESOURCE_GROUP)
+              PLATFORM_RESOURCE_GROUP: $(AVD_PLATFORM_RESOURCE_GROUP)
+              HOST_POOL_NAME: $(AVD_HOST_POOL_NAME)
+              DESKTOP_APP_GROUP_NAME: $(AVD_DESKTOP_APP_GROUP_NAME)
+              VM_NAME: $(hostName)
+              REQUESTED_FOR_UPN: $(requestedForUpn)
+              SELF_DEALLOCATE_ROLE_ID: $(AVD_SELF_DEALLOCATE_ROLE_ID)
+            inputs:
+              azureSubscription: $(AVD_ASSIGNMENT_SERVICE_CONNECTION)
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                & 'scripts/Set-AvdPersonalDesktopAssignment.ps1' `
+                  -SubscriptionId $env:SUBSCRIPTION_ID `
+                  -SessionHostResourceGroupName $env:SESSION_HOST_RESOURCE_GROUP `
+                  -PlatformResourceGroupName $env:PLATFORM_RESOURCE_GROUP `
+                  -HostPoolName $env:HOST_POOL_NAME `
+                  -DesktopAppGroupName $env:DESKTOP_APP_GROUP_NAME `
+                  -VmName $env:VM_NAME `
+                  -RequestedForUpn $env:REQUESTED_FOR_UPN `
+                  -SelfDeallocateRoleId $env:SELF_DEALLOCATE_ROLE_ID
+
+  - ${{ if ne(parameters.ritmSysId, '') }}:
+      - stage: NotifyReady
+        displayName: Mark ServiceNow request ready
+        dependsOn:
+          - ValidateRequest
+          - Assign
+        condition: succeeded()
+        variables:
+          hostName: $[ stageDependencies.ValidateRequest.Validate.outputs['request.hostName'] ]
+          requestedForUpn: $[ stageDependencies.ValidateRequest.Validate.outputs['request.requestedForUpn'] ]
+          ritmSysId: $[ stageDependencies.ValidateRequest.Validate.outputs['request.ritmSysId'] ]
+        jobs:
+          - job: ServiceNowReady
+            pool:
+              vmImage: windows-latest
+            steps:
+              - task: PowerShell@2
+                displayName: Write successful handoff to ServiceNow
+                env:
+                  SN_INSTANCE_URL: $(SN_INSTANCE_URL)
+                  SN_CLIENT_ID: $(SN_CLIENT_ID)
+                  SN_CLIENT_SECRET: $(SN_CLIENT_SECRET)
+                  SN_USERNAME: $(SN_USERNAME)
+                  SN_PASSWORD: $(SN_PASSWORD)
+                  RITM_SYS_ID: $(ritmSysId)
+                  HOST_NAME: $(hostName)
+                  REQUESTED_FOR_UPN: $(requestedForUpn)
+                  STATUS_FIELD: $(SN_STATUS_FIELD)
+                  HOST_NAME_FIELD: $(SN_HOSTNAME_FIELD)
+                inputs:
+                  pwsh: true
+                  targetType: inline
+                  script: |
+                    & 'scripts/Update-ServiceNowRitm.ps1' `
+                      -InstanceUrl $env:SN_INSTANCE_URL `
+                      -ClientId $env:SN_CLIENT_ID `
+                      -ClientSecret $env:SN_CLIENT_SECRET `
+                      -UserName $env:SN_USERNAME `
+                      -Password $env:SN_PASSWORD `
+                      -RitmSysId $env:RITM_SYS_ID `
+                      -Status 'Ready' `
+                      -HostName $env:HOST_NAME `
+                      -StatusField $env:STATUS_FIELD `
+                      -HostNameField $env:HOST_NAME_FIELD `
+                      -Message "AVD session host $($env:HOST_NAME) passed all readiness gates and was assigned to $($env:REQUESTED_FOR_UPN). Build $(Build.BuildId)."
+
+  - stage: OnFailure
+    displayName: Preserve failed VM, drain it, and notify
+    dependsOn:
+      - ValidateRequest
+      - Provision
+      - Readiness
+      - Assign
+      - ${{ if ne(parameters.ritmSysId, '') }}:
+          - NotifyReady
+    condition: failed()
+    variables:
+      hostName: $[ stageDependencies.ValidateRequest.Validate.outputs['request.hostName'] ]
+    jobs:
+      - job: DrainAndNotify
+        pool:
+          vmImage: windows-latest
+        steps:
+          # hostName is empty when validation failed: nothing was built.
+          - task: AzureCLI@2
+            displayName: Place any registered session host in drain mode
+            condition: and(succeeded(), ne(variables.hostName, ''))
+            continueOnError: true
+            env:
+              SUBSCRIPTION_ID: $(AVD_SUBSCRIPTION_ID)
+              PLATFORM_RESOURCE_GROUP: $(AVD_PLATFORM_RESOURCE_GROUP)
+              HOST_POOL_NAME: $(AVD_HOST_POOL_NAME)
+              VM_NAME: $(hostName)
+            inputs:
+              azureSubscription: $(AVD_ASSIGNMENT_SERVICE_CONNECTION)
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                & 'scripts/Set-AvdDrainMode.ps1' `
+                  -SubscriptionId $env:SUBSCRIPTION_ID `
+                  -PlatformResourceGroupName $env:PLATFORM_RESOURCE_GROUP `
+                  -HostPoolName $env:HOST_POOL_NAME `
+                  -VmName $env:VM_NAME
+          - ${{ if ne(parameters.ritmSysId, '') }}:
+              # Uses the raw parameter so ServiceNow is told about failures that
+              # happen before validation publishes its outputs. The callback
+              # script enforces the sys_id format itself.
+              - task: PowerShell@2
+                displayName: Write failure status to ServiceNow
+                continueOnError: true
+                env:
+                  SN_INSTANCE_URL: $(SN_INSTANCE_URL)
+                  SN_CLIENT_ID: $(SN_CLIENT_ID)
+                  SN_CLIENT_SECRET: $(SN_CLIENT_SECRET)
+                  SN_USERNAME: $(SN_USERNAME)
+                  SN_PASSWORD: $(SN_PASSWORD)
+                  RITM_SYS_ID: ${{ parameters.ritmSysId }}
+                  HOST_NAME: $(hostName)
+                  STATUS_FIELD: $(SN_STATUS_FIELD)
+                  HOST_NAME_FIELD: $(SN_HOSTNAME_FIELD)
+                  BUILD_URL: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)
+                inputs:
+                  pwsh: true
+                  targetType: inline
+                  script: |
+                    & 'scripts/Update-ServiceNowRitm.ps1' `
+                      -InstanceUrl $env:SN_INSTANCE_URL `
+                      -ClientId $env:SN_CLIENT_ID `
+                      -ClientSecret $env:SN_CLIENT_SECRET `
+                      -UserName $env:SN_USERNAME `
+                      -Password $env:SN_PASSWORD `
+                      -RitmSysId ($env:RITM_SYS_ID).Trim() `
+                      -Status 'Failed' `
+                      -HostName $env:HOST_NAME `
+                      -StatusField $env:STATUS_FIELD `
+                      -HostNameField $env:HOST_NAME_FIELD `
+                      -Message "AVD build failed or could not update its ready status. The VM was preserved and drain mode was requested. Review $($env:BUILD_URL)."

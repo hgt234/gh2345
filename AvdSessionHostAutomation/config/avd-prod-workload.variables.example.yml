@@ -1,0 +1,48 @@
+# Create one Azure DevOps variable group per workload, named avd-prod-<workload>.
+# Replace every example value. The host pool, desktop application group, and
+# VNet must already exist; the pipeline only references them.
+variables:
+  AVD_SUBSCRIPTION_ID: 00000000-0000-0000-0000-000000000000
+  AVD_TENANT_ID: 00000000-0000-0000-0000-000000000000
+  # Tag value written to every deployed resource.
+  AVD_ENVIRONMENT_NAME: Production
+  # Must match the VNet region.
+  AVD_LOCATION: centralus
+  # Resource group that receives this workload's VMs.
+  AVD_SESSION_HOST_RESOURCE_GROUP: rg-example-sessionhosts
+  # Resource group holding the existing host pool and desktop application group.
+  AVD_PLATFORM_RESOURCE_GROUP: rg-example-avd
+  AVD_HOST_POOL_NAME: vdpool-example
+  AVD_DESKTOP_APP_GROUP_NAME: vdag-example
+  # Existing subnet in the networking resource group.
+  AVD_SESSION_HOST_SUBNET_ID: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example-network/providers/Microsoft.Network/virtualNetworks/vnet-example/subnets/snet-sessionhosts
+  AVD_VM_SIZE: Standard_E4bs_v5
+  AVD_OS_DISK_SKU: StandardSSD_LRS
+  # Gallery or Marketplace. The two gallery values are ignored for Marketplace.
+  AVD_IMAGE_SOURCE_TYPE: Gallery
+  AVD_GALLERY_IMAGE_DEFINITION_ID: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example-images/providers/Microsoft.Compute/galleries/acgexample/images/win11-avd-personal
+  AVD_GALLERY_IMAGE_VERSION_ID: ''
+  AVD_DSC_CONFIGURATION_URI: https://wvdportalstorageblob.blob.core.windows.net/galleryartifacts/Configuration_1.0.02774.414.zip
+  # Pre-flight gate: exact installed DisplayName values, full names, not
+  # substrings. '[]' disables the gate. The readiness identity needs VM Run
+  # Command for a non-empty list.
+  AVD_REQUIRED_APP_NAMES_JSON: '["Example App One","Example App Two"]'
+  # Entra join is always required. Enrollment proves Intune manages the device;
+  # compliance depends on policy timing, so most builds leave it off. MDE
+  # onboarding arrives through Intune and its check is optional; enabling it
+  # requires the WindowsDefenderATP permission on the readiness identity.
+  AVD_REQUIRE_INTUNE_ENROLLED: 'true'
+  AVD_REQUIRE_INTUNE_COMPLIANT: 'false'
+  AVD_REQUIRE_MDE: 'false'
+  AVD_READINESS_TIMEOUT_MINUTES: '100'
+  # GUID output selfDeallocateRoleDefinitionId of access.bicep. When set, the
+  # Assign stage grants each VM's system-assigned identity this role on its
+  # own VM so the guest idle task can deallocate it. '' disables the grant.
+  AVD_SELF_DEALLOCATE_ROLE_ID: ''
+  # Either three least-privilege connections, or set all three to one existing
+  # subscription-wide connection (see SERVICE-ACCOUNTS-AND-PERMISSIONS.md,
+  # "Running on one shared service connection"). The identity behind a shared
+  # connection still needs the Graph permissions and the two Assign roles.
+  AVD_DEPLOYMENT_SERVICE_CONNECTION: sc-avd-prod-deploy
+  AVD_READINESS_SERVICE_CONNECTION: sc-avd-prod-readiness
+  AVD_ASSIGNMENT_SERVICE_CONNECTION: sc-avd-prod-assignment

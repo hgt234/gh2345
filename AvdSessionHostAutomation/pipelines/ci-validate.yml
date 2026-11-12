@@ -1,0 +1,76 @@
+# Validation gate for changes to this repository. It deploys nothing and uses
+# no service connection.
+#
+# Azure Repos ignores 'pr:' triggers in YAML. Attach this pipeline to main as a
+# required Build validation policy (Repos > Branches > main > Branch policies).
+# On GitHub the pr trigger below applies directly.
+name: ci-validate-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+
+  - task: PowerShell@2
+    displayName: Install Pester 5 and PSScriptAnalyzer
+    inputs:
+      pwsh: true
+      targetType: inline
+      script: |
+        $ErrorActionPreference = 'Stop'
+        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+        Install-Module -Name Pester -MinimumVersion 5.0 -MaximumVersion 5.99.99 -Scope CurrentUser -Force
+        Install-Module -Name PSScriptAnalyzer -Scope CurrentUser -Force
+
+  - task: PowerShell@2
+    displayName: PSScriptAnalyzer (pipeline scripts on PowerShell 7 rules, guest scripts on 5.1 rules)
+    inputs:
+      pwsh: true
+      targetType: inline
+      script: |
+        $ErrorActionPreference = 'Stop'
+        $findings = @(Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1)
+        $findings += @(Invoke-ScriptAnalyzer -Path ./endpoint -Settings ./endpoint/PSScriptAnalyzerSettings.psd1)
+        $findings += @(Invoke-ScriptAnalyzer -Path ./technician -Settings ./technician/PSScriptAnalyzerSettings.psd1)
+        if ($findings) {
+          $findings | Format-Table RuleName, ScriptName, Line, Message -AutoSize | Out-String -Width 200 | Write-Host
+          throw "PSScriptAnalyzer: $(@($findings).Count) finding(s)"
+        }
+
+  - task: PowerShell@2
+    displayName: Pester (offline)
+    inputs:
+      pwsh: true
+      targetType: inline
+      script: |
+        $ErrorActionPreference = 'Stop'
+        Import-Module Pester -MinimumVersion 5.0 -MaximumVersion 5.99.99
+        $configuration = New-PesterConfiguration
+        $configuration.Run.Path = './tests'
+        $configuration.Run.Exit = $true
+        $configuration.Output.Verbosity = 'Normal'
+        $configuration.TestResult.Enabled = $true
+        $configuration.TestResult.OutputPath = "$(Build.ArtifactStagingDirectory)/pester-results.xml"
+        Invoke-Pester -Configuration $configuration
+
+  - task: PublishTestResults@2
+    displayName: Publish Pester results
+    condition: always()
+    inputs:
+      testResultsFormat: NUnit
+      testResultsFiles: $(Build.ArtifactStagingDirectory)/pester-results.xml
+      failTaskOnFailedTests: true
+
+  - script: |
+      set -e
+      az bicep build --file infra/session-host.bicep --stdout > /dev/null
+      az bicep build --file infra/access.bicep --stdout > /dev/null
+    displayName: Compile Bicep
