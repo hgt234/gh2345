@@ -9,6 +9,8 @@ Both paths validate the request, wait for management and security readiness, dir
 
 Start with [DEPLOYMENT-RUNBOOK.md](DEPLOYMENT-RUNBOOK.md). For reset testing, use [docs/TEARDOWN-REBUILD-VALIDATION.md](docs/TEARDOWN-REBUILD-VALIDATION.md). For Proxmox, also use [HYBRID-DEPLOYMENT-RUNBOOK.md](HYBRID-DEPLOYMENT-RUNBOOK.md).
 
+> **Production:** the POC is superseded for new builds by [production/](production/README.md), a self-contained, reference-only pipeline that builds session hosts into existing infrastructure, serves both ServiceNow and technician-started requests, and documents its own access requirements in [production/docs/SERVICE-ACCOUNTS-AND-PERMISSIONS.md](production/docs/SERVICE-ACCOUNTS-AND-PERMISSIONS.md). The POC folders remain unchanged as reference.
+
 ## Request contract
 
 ServiceNow sends exactly four immutable pipeline parameters:
@@ -49,6 +51,7 @@ AzureVirtualDesktopPoc/
 ├── image/        generalized image customizer
 ├── infra/        six deployable Bicep entry points, parameters, and modules
 ├── pipelines/    Azure-hosted and hybrid Azure DevOps pipelines
+├── production/   production build pipeline into existing infrastructure
 ├── scripts/      deployment, readiness, assignment, and teardown operations
 ├── servicenow/   Flow Designer queue scripts and concise integration contract
 └── tests/        static safety and request-contract tests
