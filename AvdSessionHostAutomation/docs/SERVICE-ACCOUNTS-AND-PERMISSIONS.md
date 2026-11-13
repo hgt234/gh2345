@@ -78,6 +78,14 @@ shared connection:**
    constrained roles.) This one-time deployment still needs the elevated
    administrator from [section 5](#5-one-time-human-setup) because
    Contributor cannot create role definitions either.
+
+   **Not needed with group-based access.** When an Entra group already holds
+   *Virtual Machine User Login* over the session-host resource group and
+   *Desktop Virtualization User* on the application group, set
+   `AVD_USER_ACCESS_MODE` to `Group`. The Assign stage then makes no user
+   grants. If `AVD_SELF_DEALLOCATE_ROLE_ID` is also `''`, the build writes no
+   role assignments at all, and neither `access.bicep` nor the elevated
+   administrator is needed. The cost is no idle self-deallocate (section 8.3).
 2. **Microsoft Graph application permissions.** Azure RBAC grants no Graph
    access at any tier. The app registration behind the shared connection
    needs the union of the permissions in the quick reference: `User.Read.All`,
@@ -235,6 +243,10 @@ identity; that design needs the ADO platform team and is not yet implemented,
 so do not describe it as such.
 
 ## 5. One-time human setup
+
+Skip this section for a workload with `AVD_USER_ACCESS_MODE: Group` and
+`AVD_SELF_DEALLOCATE_ROLE_ID: ''` on the shared Contributor connection (see
+section 2, item 1).
 
 **What we are asking for:** a PIM/JIT elevation for one administrator to run
 `infra/access.bicep` once per workload (what-if first, then
@@ -444,6 +456,9 @@ Subscription: <subscription-id>
    9cdead84-a844-4324-93f2-b2e6bb768d07) at SUBSCRIPTION scope. Select it by
    object ID (az ad sp show --id 9cdead84-a844-4324-93f2-b2e6bb768d07
    --query id -o tsv); the portal picker shows object IDs only.
+Items 2 and 3 apply only when access.bicep is deployed. Omit them for a
+workload using group-based user access with self-deallocate off.
+
 2. Provide a PIM/JIT elevation for <administrator> to deploy infra/access.bicep
    at resource groups <vm-rg>, <host-pool-rg>, <network-rg>, then remove it.
 3. Confirm the eight custom roles created by access.bicep contain no delete

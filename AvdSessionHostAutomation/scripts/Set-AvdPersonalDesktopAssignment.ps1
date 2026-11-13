@@ -11,6 +11,12 @@
     role on the desktop application group, and sets the personal session
     host's assignedUser with allowNewSession enabled.
 
+    With UserAccessMode Group, the two end-user role grants are skipped: the
+    user's access comes from an Entra group that already holds both roles, so
+    the assignment identity needs no role-assignment rights for the user.
+    Group mode does not verify the user's group membership; the request
+    workflow is responsible for adding the user to the group.
+
     When SelfDeallocateRoleId is supplied, the VM's own system-assigned
     identity is additionally granted that custom role at the VM's own scope,
     which lets the guest idle power-off task deallocate the machine. The
@@ -51,10 +57,20 @@
     Optional GUID of the workload's AVD Prod Self Deallocate custom role (the
     selfDeallocateRoleDefinitionId output of access.bicep). When set, the VM's
     system-assigned identity is granted that role on the VM itself. Empty
-    disables the grant.
+    disables the grant. The grant needs role-assignment rights in either
+    access mode.
+
+.PARAMETER UserAccessMode
+    Direct (default) grants the two end-user roles to the user. Group skips
+    them because an Entra group already holds Virtual Machine User Login over
+    the session hosts and Desktop Virtualization User on the application
+    group. An empty value or an unresolved Azure DevOps macro means Direct.
 
 .EXAMPLE
     ./Set-AvdPersonalDesktopAssignment.ps1 -SubscriptionId $sub -SessionHostResourceGroupName rg-avd-hosts -PlatformResourceGroupName rg-avd -HostPoolName vdpool-prod -DesktopAppGroupName vdag-prod -VmName AVD0012345 -RequestedForUpn user@contoso.com -WhatIf
+
+.EXAMPLE
+    ./Set-AvdPersonalDesktopAssignment.ps1 -SubscriptionId $sub -SessionHostResourceGroupName rg-avd-hosts -PlatformResourceGroupName rg-avd -HostPoolName vdpool-prod -DesktopAppGroupName vdag-prod -VmName AVD0012345 -RequestedForUpn user@contoso.com -UserAccessMode Group -WhatIf
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
@@ -66,11 +82,21 @@ param(
     [Parameter(Mandatory)][ValidatePattern('\AAVD[0-9]{1,12}\z')][string]$VmName,
     [Parameter(Mandatory)][string]$RequestedForUpn,
     [string]$UserObjectId,
-    [string]$SelfDeallocateRoleId = ''
+    [string]$SelfDeallocateRoleId = '',
+    # Not a ValidateSet: an undefined variable arrives as the literal
+    # $(AVD_USER_ACCESS_MODE) macro and must fall back to Direct.
+    [string]$UserAccessMode = 'Direct'
 )
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
+
+# Azure DevOps leaves an undefined $(VARIABLE_NAME) macro unchanged; treat it
+# as absent so an existing variable group keeps the original Direct behavior.
+$UserAccessMode = if ($UserAccessMode -match '^\$\([A-Za-z0-9_.-]+\)$' -or [string]::IsNullOrWhiteSpace($UserAccessMode)) { 'Direct' } else { $UserAccessMode.Trim() }
+if ($UserAccessMode -inotin @('Direct', 'Group')) {
+    throw "UserAccessMode '$UserAccessMode' is not valid. Use Direct or Group."
+}
 
 function Invoke-AzCliJson {
     param([Parameter(Mandatory)][string[]]$ArgumentList)
@@ -137,9 +163,17 @@ if ([string]::IsNullOrWhiteSpace($UserObjectId)) {
     $UserObjectId = [string]$user.id
 }
 
-# Built-in roles: Virtual Machine User Login and Desktop Virtualization User.
-Grant-ScopedRoleAssignment -Scope $vmId -RoleDefinitionId 'fb879df8-f326-4884-b1cf-06f3ad86be52' -PrincipalId $UserObjectId -PrincipalType 'User'
-Grant-ScopedRoleAssignment -Scope $appGroupId -RoleDefinitionId '1d18fff3-a72a-46b5-b4a9-0b38a3cd7e63' -PrincipalId $UserObjectId -PrincipalType 'User'
+if ($UserAccessMode -eq 'Direct') {
+    # Built-in roles: Virtual Machine User Login and Desktop Virtualization User.
+    Grant-ScopedRoleAssignment -Scope $vmId -RoleDefinitionId 'fb879df8-f326-4884-b1cf-06f3ad86be52' -PrincipalId $UserObjectId -PrincipalType 'User'
+    Grant-ScopedRoleAssignment -Scope $appGroupId -RoleDefinitionId '1d18fff3-a72a-46b5-b4a9-0b38a3cd7e63' -PrincipalId $UserObjectId -PrincipalType 'User'
+}
+else {
+    # Group mode: an Entra group already holds both roles, so no grant is
+    # made for the user. The Graph lookup above still proves the account
+    # exists and is enabled before the host is bound to it.
+    Write-Verbose "UserAccessMode is Group; skipping the end-user role grants for '$RequestedForUpn'."
+}
 
 # Azure DevOps leaves an undefined $(VARIABLE_NAME) macro unchanged; treat it
 # as absent so the grant is simply skipped until the role is configured.

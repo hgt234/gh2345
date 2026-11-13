@@ -280,6 +280,7 @@ stages:
               VM_NAME: $(hostName)
               REQUESTED_FOR_UPN: $(requestedForUpn)
               SELF_DEALLOCATE_ROLE_ID: $(AVD_SELF_DEALLOCATE_ROLE_ID)
+              USER_ACCESS_MODE: $(AVD_USER_ACCESS_MODE)
             inputs:
               azureSubscription: $(AVD_ASSIGNMENT_SERVICE_CONNECTION)
               scriptType: pscore
@@ -293,7 +294,8 @@ stages:
                   -DesktopAppGroupName $env:DESKTOP_APP_GROUP_NAME `
                   -VmName $env:VM_NAME `
                   -RequestedForUpn $env:REQUESTED_FOR_UPN `
-                  -SelfDeallocateRoleId $env:SELF_DEALLOCATE_ROLE_ID
+                  -SelfDeallocateRoleId $env:SELF_DEALLOCATE_ROLE_ID `
+                  -UserAccessMode $env:USER_ACCESS_MODE
 
   - ${{ if ne(parameters.ritmSysId, '') }}:
       - stage: NotifyReady

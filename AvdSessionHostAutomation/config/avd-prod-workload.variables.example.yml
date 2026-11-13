@@ -35,14 +35,27 @@ variables:
   AVD_REQUIRE_INTUNE_COMPLIANT: 'false'
   AVD_REQUIRE_MDE: 'false'
   AVD_READINESS_TIMEOUT_MINUTES: '100'
+  # How the end user gets desktop access.
+  #   Group:  an Entra group already holds Virtual Machine User Login over the
+  #           session-host resource group (or wider) and Desktop
+  #           Virtualization User on the application group. The build makes
+  #           no role grants for the user, so access.bicep (guide step 4.3)
+  #           is not needed. The request workflow must add the user to the
+  #           group; the build does not check membership.
+  #   Direct: the build grants both roles to the user. Needs access.bicep,
+  #           because Contributor cannot write role assignments.
+  # Undefined or '' means Direct.
+  AVD_USER_ACCESS_MODE: Group
   # GUID output selfDeallocateRoleDefinitionId of access.bicep. When set, the
   # Assign stage grants each VM's system-assigned identity this role on its
   # own VM so the guest idle task can deallocate it. '' disables the grant.
+  # Setting it needs access.bicep in either access mode.
   AVD_SELF_DEALLOCATE_ROLE_ID: ''
   # Either three least-privilege connections, or set all three to one existing
   # subscription-wide connection (see SERVICE-ACCOUNTS-AND-PERMISSIONS.md,
   # "Running on one shared service connection"). The identity behind a shared
-  # connection still needs the Graph permissions and the two Assign roles.
+  # connection still needs the Graph permissions; it needs the two Assign
+  # roles from access.bicep only for Direct mode or self-deallocate.
   AVD_DEPLOYMENT_SERVICE_CONNECTION: sc-avd-prod-deploy
   AVD_READINESS_SERVICE_CONNECTION: sc-avd-prod-readiness
   AVD_ASSIGNMENT_SERVICE_CONNECTION: sc-avd-prod-assignment

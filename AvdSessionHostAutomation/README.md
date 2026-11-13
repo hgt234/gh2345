@@ -67,7 +67,10 @@ variable group, so it runs on either model without code changes:
   two kinds of grant: the two end-user roles to users, and the
   self-deallocate role to each VM's own identity. It cannot grant Owner or
   anything else. The role GUIDs are namespaced so deploying them cannot
-  overwrite earlier POC roles of the same name.
+  overwrite earlier POC roles of the same name. With
+  `AVD_USER_ACCESS_MODE: Group` and self-deallocate off, the build writes no
+  role assignments and `access.bicep` is not deployed at all; an Entra group
+  supplies the user's access instead.
 - Host-pool write exists only to renew the registration token; the failure
   path drains the host (`allowNewSession=false`) and preserves the VM for
   investigation.
@@ -96,7 +99,9 @@ Details and rationale in section 8 of
   `access.bicep` defines the `AVD Prod Self Deallocate` role (VM read +
   deallocate only) and the build's Assign stage grants it to each new VM's
   own system-assigned identity, on that VM only
-  (`AVD_SELF_DEALLOCATE_ROLE_ID` in the variable group enables this).
+  (`AVD_SELF_DEALLOCATE_ROLE_ID` in the variable group enables this). It
+  needs `access.bicep`, so a workload that skips that deployment has no idle
+  power-off.
 - [endpoint/Invoke-AvdSelfDeallocate.ps1](endpoint/Invoke-AvdSelfDeallocate.ps1)
   runs on each host as SYSTEM via an Intune scheduled task. If any session
   exists - active or disconnected - it exits; otherwise, once uptime passes

@@ -348,6 +348,59 @@ Describe 'Set-AvdPersonalDesktopAssignment' {
         Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*--method PATCH*' }
     }
 
+    Context 'UserAccessMode' {
+        It 'in Group mode grants no user roles but still checks the user and assigns the host' {
+            & $script:assignScript @script:assignArguments -UserAccessMode Group *>&1 | Out-Null
+            Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like 'role assignment*' }
+            Should -Invoke az -Times 1 -Exactly -ParameterFilter { ($args -join ' ') -like 'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' }
+            Should -Invoke az -Times 1 -Exactly -ParameterFilter { ($args -join ' ') -like '*--method PATCH*' }
+        }
+
+        It 'in Group mode still grants the self-deallocate role when configured' {
+            & $script:assignScript @script:assignArguments -UserAccessMode Group -SelfDeallocateRoleId '11111111-1111-1111-1111-111111111111' *>&1 | Out-Null
+            Should -Invoke az -Times 1 -Exactly -ParameterFilter { ($args -join ' ') -like 'role assignment create*' }
+            Should -Invoke az -Times 1 -Exactly -ParameterFilter {
+                ($args -join ' ') -like '*role assignment create*ServicePrincipal*11111111-1111-1111-1111-111111111111*'
+            }
+        }
+
+        It 'in Group mode with -WhatIf changes nothing' {
+            $output = & $script:assignScript @script:assignArguments -UserAccessMode Group -WhatIf *>&1 | Out-String
+            $output | Should -BeLike '*Nothing was changed*'
+            Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like 'role assignment create*' }
+            Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*--method PATCH*' }
+        }
+
+        It 'in Group mode still refuses a disabled user' {
+            Mock az {
+                $global:LASTEXITCODE = 0
+                $command = $args -join ' '
+                switch -Wildcard ($command) {
+                    'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { '{"id":"user-1","accountEnabled":false}' }
+                    default { throw "Unexpected az call in test: az $command" }
+                }
+            }
+            { & $script:assignScript @script:assignArguments -UserAccessMode Group *>&1 | Out-Null } | Should -Throw '*not found or is disabled*'
+            Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*--method PATCH*' }
+        }
+
+        It 'treats <Value> as Direct and grants both user roles' -TestCases @(
+            @{ Value = '$(AVD_USER_ACCESS_MODE)' }
+            @{ Value = '' }
+            @{ Value = 'direct' }
+        ) {
+            param($Value)
+            & $script:assignScript @script:assignArguments -UserAccessMode $Value *>&1 | Out-Null
+            Should -Invoke az -Times 1 -Exactly -ParameterFilter { ($args -join ' ') -like '*role assignment create*fb879df8-f326-4884-b1cf-06f3ad86be52*' }
+            Should -Invoke az -Times 1 -Exactly -ParameterFilter { ($args -join ' ') -like '*role assignment create*1d18fff3-a72a-46b5-b4a9-0b38a3cd7e63*' }
+        }
+
+        It 'rejects an unknown mode before any Azure call' {
+            { & $script:assignScript @script:assignArguments -UserAccessMode 'Groups' *>&1 | Out-Null } | Should -Throw '*not valid*'
+            Should -Invoke az -Times 0 -Exactly
+        }
+    }
+
     It 'refuses a host assigned to someone else' {
         Mock az {
             $global:LASTEXITCODE = 0
@@ -488,6 +541,11 @@ Describe 'Provision pipeline' {
     It 'orders provision, readiness, and assignment correctly' {
         $script:pipeline.IndexOf('Wait-AvdReadiness.ps1') | Should -BeGreaterThan $script:pipeline.IndexOf('New-AvdSessionHost.ps1')
         $script:pipeline.IndexOf('Set-AvdPersonalDesktopAssignment.ps1') | Should -BeGreaterThan $script:pipeline.IndexOf('Wait-AvdReadiness.ps1')
+    }
+
+    It 'passes the workload user access mode to the assignment script' {
+        $script:pipeline | Should -Match 'USER_ACCESS_MODE: \$\(AVD_USER_ACCESS_MODE\)'
+        $script:pipeline | Should -Match '-UserAccessMode \$env:USER_ACCESS_MODE'
     }
 
     It 'reports readiness back to the build run' {

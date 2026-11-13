@@ -39,7 +39,7 @@ Not built as pipelines, on purpose:
 
 | Activity | How it is done instead | Why not a pipeline |
 |---|---|---|
-| Deploy custom roles (`infra/access.bicep`) | Elevated administrator, once per workload, from a workstation or Cloud Shell (step 4) | Creating role definitions needs rights the shared Contributor connection does not have, and a standing elevated connection for a once-a-year task is more risk than value |
+| Deploy custom roles (`infra/access.bicep`) | Elevated administrator, once per workload, from a workstation or Cloud Shell (step 4.3). Not needed with group-based user access and self-deallocate off | Creating role definitions needs rights the shared Contributor connection does not have, and a standing elevated connection for a once-a-year task is more risk than value |
 | Start VM on Connect role and host-pool setting | One-time administrator action (step 6) | Single assignment, never repeated |
 | Decommission or teardown | Separate, human-approved process | Deleting resources is excluded from this solution by design |
 
@@ -126,9 +126,29 @@ these **Application** permissions to the app and grant admin consent:
 and `Machine.Read.All` on WindowsDefenderATP only if the MDE gate will be
 enabled.
 
-### 4.3 Deploy the custom roles (once per workload)
+### 4.3 Deploy the custom roles (once per workload, only when needed)
 
-The administrator activates the JIT elevation from the access doc, then runs
+The build writes role assignments only in two cases, and Contributor cannot
+write role assignments. Decide first whether this step applies:
+
+| `AVD_USER_ACCESS_MODE` | `AVD_SELF_DEALLOCATE_ROLE_ID` | Step 4.3 |
+|---|---|---|
+| `Group` | `''` (idle self-deallocate off) | **Skip it.** The build makes no role grants. |
+| `Group` | set | Required, for the per-VM self-deallocate grant. |
+| `Direct` | either | Required, for the end-user grants. |
+
+**Group mode prerequisites.** Before skipping this step, confirm that the
+Entra group the request workflow adds users to holds:
+
+- **Virtual Machine User Login** at the session-host resource group or a
+  wider scope. A grant on the application group does not cover VM sign-in;
+  Entra-joined hosts check this role against the VM.
+- **Desktop Virtualization User** on the desktop application group.
+
+The build does not check group membership. The user must be in the group
+before they sign in, or the desktop is ready but the sign-in is refused.
+
+Otherwise, the administrator activates the JIT elevation from the access doc, then runs
 the following from the repository root. Under the shared-connection model,
 pass the same object ID three times:
 
@@ -151,8 +171,9 @@ Review the what-if before creating: it should show only role definitions and
 role assignments. Record the GUID printed by the create command; it becomes
 `AVD_SELF_DEALLOCATE_ROLE_ID` in step 5. Then end the elevation.
 
-Even under Contributor, this step is required: Contributor cannot write role
-assignments, and the build grants the end user's sign-in and desktop roles.
+When this step applies, it is required even under Contributor: Contributor
+cannot write role assignments, and the build grants the end user's sign-in
+and desktop roles (Direct mode) or the VM's self-deallocate role.
 
 ## 5. Variable groups
 
@@ -168,7 +189,11 @@ assignments, and the build grants the end user's sign-in and desktop roles.
    with real values:
    - set all three `AVD_*_SERVICE_CONNECTION` variables to the shared
      connection's **name**, exactly as shown in Service connections;
-   - set `AVD_SELF_DEALLOCATE_ROLE_ID` to the GUID from step 4.3;
+   - set `AVD_USER_ACCESS_MODE` to `Group` when an Entra group already grants
+     desktop access (the step 4.3 prerequisites), or `Direct` to have the
+     build grant the roles per user;
+   - set `AVD_SELF_DEALLOCATE_ROLE_ID` to the GUID from step 4.3, or `''`
+     when step 4.3 was skipped;
    - set `AVD_REQUIRED_APP_NAMES_JSON` to the exact installed DisplayNames of
      the base applications, for example `["App One","App Two"]`. Use the full
      names, not substrings. `[]` disables the app gate.
@@ -195,8 +220,11 @@ can wait.
    commands are in section 8.1 of the access doc; Microsoft documents that a
    lower scope breaks the feature.
 2. **Idle self-deallocate:** nothing to do in Azure. The provision pipeline
-   grants each VM's identity the role at build time, now that
-   `AVD_SELF_DEALLOCATE_ROLE_ID` is set.
+   grants each VM's identity the role at build time when
+   `AVD_SELF_DEALLOCATE_ROLE_ID` is set. If step 4.3 was skipped, the
+   variable is `''`, no VM gets the role, and idle power-off is off: the
+   guest task below would find no permission to deallocate. Hosts then stay
+   running until stopped some other way.
 3. **Guest task (Intune):** the Intune team deploys
    [../endpoint/Invoke-AvdSelfDeallocate.ps1](../endpoint/Invoke-AvdSelfDeallocate.ps1)
    to the AVD device group as a scheduled task running as SYSTEM, for example
@@ -333,7 +361,9 @@ Run in this order, using a test RITM number and a licensed test user:
      network or host pool;
    - the Readiness stage's run summary shows every gate passed;
    - the user can sign in to the desktop;
-   - the VM identity holds `AVD Prod Self Deallocate` on its own VM.
+   - when self-deallocate is configured, the VM identity holds
+     `AVD Prod Self Deallocate` on its own VM;
+   - in Group mode, the build created no role assignment for the user.
 4. **Power cycle** (after the Intune wrapper exists): leave the desktop idle
    with the user signed out; confirm it deallocates after the threshold and
    starts again when the user connects.
@@ -344,8 +374,10 @@ Run in this order, using a test RITM number and a licensed test user:
 
 ## 13. Adding a workload later
 
-1. Elevated administrator: deploy `access.bicep` for the new workload
-   (step 4.3) and record its self-deallocate role GUID.
+1. If step 4.3 applies to the new workload, the elevated administrator
+   deploys `access.bicep` for it and records its self-deallocate role GUID.
+   In Group mode, confirm the workload's Entra group holds the two roles
+   over its session-host resource group and application group instead.
 2. Create `avd-prod-<workload>` (step 5.1) and authorize the provision
    pipeline for it (step 8.1).
 3. Pull request: add the name to the YAML `values` list (step 7).
