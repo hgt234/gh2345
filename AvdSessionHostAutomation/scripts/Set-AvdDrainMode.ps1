@@ -60,9 +60,18 @@ if (-not $PSCmdlet.ShouldProcess($VmName, "Set allowNewSession=false on session 
     return
 }
 
+# The body goes through a file: on Windows agents az is az.cmd, and cmd.exe
+# strips the double quotes from an inline JSON argument.
 $body = @{ properties = @{ allowNewSession = $false } } | ConvertTo-Json -Compress
-$raw = & az rest --method PATCH --url "https://management.azure.com$($sessionHost.id)?api-version=2024-04-03" --headers 'Content-Type=application/json' --body $body --only-show-errors --output none 2>&1
-if ($LASTEXITCODE -ne 0) {
-    throw "Unable to place '$VmName' in drain mode: $($raw -join [Environment]::NewLine)"
+$bodyPath = Join-Path ([IO.Path]::GetTempPath()) "avd-drain-$([Guid]::NewGuid().ToString('N')).json"
+try {
+    $body | Set-Content -LiteralPath $bodyPath -Encoding utf8
+    $raw = & az rest --method PATCH --url "https://management.azure.com$($sessionHost.id)?api-version=2024-04-03" --headers 'Content-Type=application/json' --body "@$bodyPath" --only-show-errors --output none 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to place '$VmName' in drain mode: $($raw -join [Environment]::NewLine)"
+    }
+}
+finally {
+    Remove-Item -LiteralPath $bodyPath -Force -ErrorAction SilentlyContinue
 }
 Write-Output "Placed '$VmName' in drain mode after provisioning failure."

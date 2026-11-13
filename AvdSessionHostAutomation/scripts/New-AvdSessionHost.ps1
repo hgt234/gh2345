@@ -213,12 +213,21 @@ if ([string]::IsNullOrWhiteSpace($registrationToken) -or $tokenExpiration -lt [D
                 }
             }
         } | ConvertTo-Json -Depth 10 -Compress
-        [void](Invoke-AzCliJson -ArgumentList @(
-            'rest', '--method', 'PATCH',
-            '--url', "https://management.azure.com${hostPoolId}?api-version=2024-04-03",
-            '--headers', 'Content-Type=application/json',
-            '--body', $registrationBody
-        ))
+        # The body goes through a file: on Windows agents az is az.cmd, and
+        # cmd.exe strips the double quotes from an inline JSON argument.
+        $registrationBodyPath = Join-Path ([IO.Path]::GetTempPath()) "avd-registration-$([Guid]::NewGuid().ToString('N')).json"
+        try {
+            $registrationBody | Set-Content -LiteralPath $registrationBodyPath -Encoding utf8
+            [void](Invoke-AzCliJson -ArgumentList @(
+                'rest', '--method', 'PATCH',
+                '--url', "https://management.azure.com${hostPoolId}?api-version=2024-04-03",
+                '--headers', 'Content-Type=application/json',
+                '--body', "@$registrationBodyPath"
+            ))
+        }
+        finally {
+            Remove-Item -LiteralPath $registrationBodyPath -Force -ErrorAction SilentlyContinue
+        }
         $tokenResponse = Invoke-AzCliJson -ArgumentList @(
             'rest', '--method', 'POST',
             '--url', "https://management.azure.com$hostPoolId/retrieveRegistrationToken?api-version=2024-04-03"
@@ -261,7 +270,11 @@ try {
             osDiskSku = @{ value = $OsDiskSku }
         }
     }
-    $parameters | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $parameterFile -Encoding utf8
+    # The temporary parameter file and the what-if report are local working
+    # files, not changes to Azure. They are exempt from -WhatIf and -Confirm:
+    # otherwise -WhatIf skips writing the file and the ARM what-if, the one
+    # step -WhatIf exists to run, cannot read its parameters.
+    $parameters | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $parameterFile -Encoding utf8 -WhatIf:$false -Confirm:$false
 
     $whatIfRaw = & az deployment group what-if `
         --name "avd-$($VmName.ToLowerInvariant())-whatif" `
@@ -278,9 +291,9 @@ try {
     if ($WhatIfReportPath) {
         $reportParent = Split-Path -Parent $WhatIfReportPath
         if ($reportParent -and -not (Test-Path -LiteralPath $reportParent)) {
-            New-Item -ItemType Directory -Path $reportParent -Force | Out-Null
+            New-Item -ItemType Directory -Path $reportParent -Force -WhatIf:$false -Confirm:$false | Out-Null
         }
-        $whatIfText | Set-Content -LiteralPath $WhatIfReportPath -Encoding utf8
+        $whatIfText | Set-Content -LiteralPath $WhatIfReportPath -Encoding utf8 -WhatIf:$false -Confirm:$false
     }
     $whatIfResult = $whatIfText | ConvertFrom-Json -Depth 100
     if (@($whatIfResult.changes | Where-Object changeType -In @('Delete', 'Recreate')).Count -gt 0) {
@@ -305,7 +318,8 @@ try {
 }
 finally {
     if (Test-Path -LiteralPath $parameterFile) {
-        Remove-Item -LiteralPath $parameterFile -Force
+        # Always delete: the file holds the generated local admin password.
+        Remove-Item -LiteralPath $parameterFile -Force -WhatIf:$false -Confirm:$false
     }
     $registrationToken = $null
 }

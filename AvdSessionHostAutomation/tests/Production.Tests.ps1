@@ -118,6 +118,39 @@ Describe 'New-AvdSessionHost' {
             & $script:deployScript @script:deployArguments -WhatIf *>&1 | Out-Null
             Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*--method PATCH*' }
         }
+
+        # Regression: -WhatIf once also skipped writing the temporary parameter
+        # file, so the real ARM what-if failed with "Unable to parse parameter".
+        It 'writes the parameter file the what-if reads, writes the report, and then deletes the file' {
+            # The mock records what it saw in a TestDrive file: variables it
+            # sets are not visible to the test body. -WhatIf:$false is needed
+            # because the mock runs inside the script's -WhatIf scope.
+            $capture = Join-Path $TestDrive 'what-if-capture.json'
+            Mock az {
+                $global:LASTEXITCODE = 0
+                $command = $args -join ' '
+                switch -Wildcard ($command) {
+                    'account show*' { '{"id":"sub-1","tenantId":"tenant-1"}' }
+                    'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { '{"id":"user-1","userPrincipalName":"user@contoso.com","accountEnabled":true}' }
+                    'vm list*' { '[]' }
+                    'rest --method POST --url *retrieveRegistrationToken*' { '{"token":"fixture-token","expirationTime":"2099-01-01T00:00:00Z"}' }
+                    'deployment group what-if*' {
+                        $path = ([string]($args | Where-Object { "$_" -like '@*' } | Select-Object -First 1)).Substring(1)
+                        $vmName = if (Test-Path -LiteralPath $path) { [string](Get-Content -LiteralPath $path -Raw | ConvertFrom-Json).parameters.vmName.value } else { '' }
+                        @{ path = $path; vmName = $vmName } | ConvertTo-Json |
+                            Set-Content -LiteralPath (Join-Path $TestDrive 'what-if-capture.json') -WhatIf:$false
+                        '{"changes":[]}'
+                    }
+                    default { throw "Unexpected az call in test: az $command" }
+                }
+            }
+            $report = Join-Path $TestDrive 'out/session-host-what-if.json'
+            & $script:deployScript @script:deployArguments -WhatIfReportPath $report -WhatIf *>&1 | Out-Null
+            $seen = Get-Content -LiteralPath $capture -Raw | ConvertFrom-Json
+            $seen.vmName | Should -BeExactly 'AVD0012345'
+            Test-Path -LiteralPath $report | Should -BeTrue
+            Test-Path -LiteralPath $seen.path | Should -BeFalse
+        }
     }
 
     Context 'Safety rails' {
@@ -443,9 +476,28 @@ Describe 'Set-AvdDrainMode' {
         Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*--method PATCH*' }
     }
 
-    It 'drains a registered host' {
+    # Regression: an inline JSON body lost its quotes through az.cmd on the
+    # Windows agent. The body must arrive as a file reference.
+    It 'drains a registered host with the body passed as a file' {
+        $capture = Join-Path $TestDrive 'drain-body.json'
+        Mock az {
+            $global:LASTEXITCODE = 0
+            $command = $args -join ' '
+            switch -Wildcard ($command) {
+                'rest --method GET --url *sessionHosts*' { '{"value":[{"name":"vdpool-prod/AVD0012345.contoso.com","id":"/host","properties":{"status":"Available","allowNewSession":true}}]}' }
+                'rest --method PATCH*' {
+                    $bodyArgument = [string]$args[([array]::IndexOf($args, '--body')) + 1]
+                    if ($bodyArgument -like '@*') {
+                        Copy-Item -LiteralPath $bodyArgument.Substring(1) -Destination (Join-Path $TestDrive 'drain-body.json') -WhatIf:$false
+                    }
+                    ''
+                }
+                default { throw "Unexpected az call in test: az $command" }
+            }
+        }
         & $script:drainScript @script:drainArguments *>&1 | Out-Null
-        Should -Invoke az -Times 1 -Exactly -ParameterFilter { ($args -join ' ') -like '*--method PATCH*allowNewSession*' }
+        Should -Invoke az -Times 1 -Exactly -ParameterFilter { ($args -join ' ') -like '*--method PATCH*--body @*' }
+        (Get-Content -LiteralPath $capture -Raw | ConvertFrom-Json).properties.allowNewSession | Should -BeFalse
     }
 
     It 'changes nothing when no registration exists' {
@@ -554,6 +606,21 @@ Describe 'Provision pipeline' {
 
     It 'never references POC variable groups' {
         $script:pipeline | Should -Not -Match 'avd-poc-'
+    }
+}
+
+Describe 'Azure CLI request bodies' {
+    # Regression: on Windows agents az is az.cmd, and cmd.exe strips the double
+    # quotes from an inline JSON --body, which ARM rejects as invalid content.
+    # Every --body must therefore be a file reference (@path).
+    It '<Name> passes every --body as a file reference' -TestCases @(
+        Get-ChildItem -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') -Filter '*.ps1' |
+            ForEach-Object { @{ Name = $_.Name; Path = $_.FullName } }
+    ) {
+        $lines = @(Get-Content -LiteralPath $Path | Where-Object { $_ -match "--body" -and $_ -notmatch '^\s*#' })
+        foreach ($line in $lines) {
+            $line | Should -Match "--body'?,?\s+`"@" -Because "an inline JSON body breaks through az.cmd: $($line.Trim())"
+        }
     }
 }
 
