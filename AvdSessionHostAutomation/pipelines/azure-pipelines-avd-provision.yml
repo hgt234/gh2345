@@ -138,6 +138,7 @@ stages:
               GALLERY_IMAGE_DEFINITION_ID: $(AVD_GALLERY_IMAGE_DEFINITION_ID)
               GALLERY_IMAGE_VERSION_ID: $(AVD_GALLERY_IMAGE_VERSION_ID)
               AVD_DSC_URI: $(AVD_DSC_CONFIGURATION_URI)
+              POWER_OFF_IDENTITY_ID: $(AVD_POWER_OFF_IDENTITY_ID)
             inputs:
               azureSubscription: $(AVD_DEPLOYMENT_SERVICE_CONNECTION)
               scriptType: pscore
@@ -163,6 +164,7 @@ stages:
                   -GalleryImageDefinitionId $env:GALLERY_IMAGE_DEFINITION_ID `
                   -GalleryImageVersionId $env:GALLERY_IMAGE_VERSION_ID `
                   -AvdDscConfigurationUri $env:AVD_DSC_URI `
+                  -PowerOffIdentityId $env:POWER_OFF_IDENTITY_ID `
                   -TemplateFile 'infra/session-host.bicep' `
                   -WhatIfReportPath '$(artifactDirectory)/session-host-what-if.json'
           - task: PublishPipelineArtifact@1

@@ -22,9 +22,15 @@
        token are read from IMDS (169.254.169.254, link-local, no credential
        stored anywhere). The metadata name must match this computer's name;
        on mismatch the script refuses to act.
-    4. Deallocate: a single POST to this VM's own deallocate action. The
-       system-assigned identity holds the AVD Prod Self Deallocate role
-       scoped to this VM only, so the blast radius is this machine.
+    4. Deallocate: a single POST to this VM's own deallocate action, using
+       one of two identities:
+       - without ManagedIdentityClientId, the system-assigned identity,
+         which holds the AVD Prod Self Deallocate role on this VM only;
+       - with ManagedIdentityClientId, the workload's shared user-assigned
+         power-off identity, which holds deallocate rights over the whole
+         session-host resource group. This script still targets only its
+         own VM, but any code running as SYSTEM or local administrator on
+         any host can request that identity's token.
 
     Deallocate, not a guest shutdown: only deallocation releases the compute
     hardware and stops billing. The call returns accepted and Azure then
@@ -40,22 +46,35 @@
 .PARAMETER ManagementEndpoint
     Azure Resource Manager endpoint; the default is the public cloud.
 
+.PARAMETER ManagedIdentityClientId
+    Client ID of the workload's user-assigned power-off identity. Sent to
+    IMDS as client_id so the token always comes from that identity. The VM
+    also has a system-assigned identity, and the IMDS docs do not define
+    which one is used when neither is named, so set this whenever the
+    shared identity is in use. Omit it to use the system-assigned identity.
+
 .EXAMPLE
     .\Invoke-AvdSelfDeallocate.ps1 -MinimumUptimeMinutes 60 -WhatIf
 
+.EXAMPLE
+    .\Invoke-AvdSelfDeallocate.ps1 -MinimumUptimeMinutes 60 -ManagedIdentityClientId 11111111-1111-1111-1111-111111111111 -WhatIf
+
 .NOTES
-    Requires the VM's system-assigned managed identity to hold
+    Requires the identity used to hold
     Microsoft.Compute/virtualMachines/read and
-    Microsoft.Compute/virtualMachines/deallocate/action on this VM (granted
-    by the build pipeline's Assign stage). IMDS calls must not go through a
-    proxy; SYSTEM normally has none configured.
+    Microsoft.Compute/virtualMachines/deallocate/action on this VM: either
+    the system-assigned identity (granted by the build pipeline's Assign
+    stage) or the shared user-assigned identity (granted once during
+    workload preparation). IMDS calls must not go through a proxy; SYSTEM
+    normally has none configured.
     https://learn.microsoft.com/azure/virtual-machines/instance-metadata-service
     https://learn.microsoft.com/azure/active-directory/managed-identities-azure-resources/how-to-use-vm-token
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
     [ValidateRange(5, 1440)][int]$MinimumUptimeMinutes = 60,
-    [ValidatePattern('\Ahttps://[a-z0-9.-]+\z')][string]$ManagementEndpoint = 'https://management.azure.com'
+    [ValidatePattern('\Ahttps://[a-z0-9.-]+\z')][string]$ManagementEndpoint = 'https://management.azure.com',
+    [ValidatePattern('\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z')][string]$ManagedIdentityClientId
 )
 
 Set-StrictMode -Version 3.0
@@ -99,12 +118,20 @@ function Get-ImdsComputeInstance {
 function Get-ImdsAccessToken {
     [CmdletBinding()]
     [OutputType([string])]
-    param([Parameter(Mandatory)][string]$Resource)
+    param(
+        [Parameter(Mandatory)][string]$Resource,
+        [string]$ClientId
+    )
 
     $encodedResource = [Uri]::EscapeDataString($Resource)
+    $tokenUri = "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$encodedResource"
+    if ($ClientId) {
+        # Name the user-assigned identity explicitly; see the parameter help.
+        $tokenUri += "&client_id=$([Uri]::EscapeDataString($ClientId))"
+    }
     $response = Invoke-RestMethod -Method Get -TimeoutSec 10 `
         -Headers @{ Metadata = 'true' } `
-        -Uri "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$encodedResource"
+        -Uri $tokenUri
     if (-not $response.access_token) {
         throw 'IMDS did not return a managed-identity access token.'
     }
@@ -138,7 +165,7 @@ if (-not $PSCmdlet.ShouldProcess($vmName, "Deallocate idle session host (0 sessi
     return
 }
 
-$token = Get-ImdsAccessToken -Resource "$ManagementEndpoint/"
+$token = Get-ImdsAccessToken -Resource "$ManagementEndpoint/" -ClientId $ManagedIdentityClientId
 try {
     Invoke-RestMethod -Method Post -TimeoutSec 60 `
         -Headers @{ Authorization = "Bearer $token" } `

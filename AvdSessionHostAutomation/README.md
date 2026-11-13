@@ -100,8 +100,14 @@ Details and rationale in section 8 of
   deallocate only) and the build's Assign stage grants it to each new VM's
   own system-assigned identity, on that VM only
   (`AVD_SELF_DEALLOCATE_ROLE_ID` in the variable group enables this). It
-  needs `access.bicep`, so a workload that skips that deployment has no idle
-  power-off.
+  needs `access.bicep`.
+- **Without `access.bicep`**, a workload uses one shared user-assigned
+  identity instead. It is prepared once with VM read + deallocate over the
+  session-host resource group, and the build attaches it to each VM
+  (`AVD_POWER_OFF_IDENTITY_ID`), which Contributor can do. Any host can use
+  that identity against every VM in the resource group, so keep the role to
+  read + deallocate and the scope to that resource group. Setup is in step 6
+  of the deployment guide.
 - [endpoint/Invoke-AvdSelfDeallocate.ps1](endpoint/Invoke-AvdSelfDeallocate.ps1)
   runs on each host as SYSTEM via an Intune scheduled task. If any session
   exists - active or disconnected - it exits; otherwise, once uptime passes
