@@ -85,13 +85,6 @@
 .PARAMETER WhatIfReportPath
     File that receives the full ARM what-if JSON.
 
-.PARAMETER PowerOffIdentityId
-    Optional resource ID of the workload's user-assigned managed identity for
-    idle power-off. It is attached to the VM next to the system-assigned
-    identity. The identity and its role are prepared once per workload;
-    attaching it writes no role assignment. Empty or an unresolved Azure
-    DevOps macro attaches nothing.
-
 .EXAMPLE
     ./New-AvdSessionHost.ps1 -SubscriptionId $sub -TenantId $tenant -ResourceGroupName rg-avd-hosts -PlatformResourceGroupName rg-avd -HostPoolName vdpool-prod -SubnetId $subnetId -VmName AVD0012345 -RitmNumber RITM0012345 -RequestedForUpn user@contoso.com -TemplateFile ../infra/session-host.bicep -AvdDscConfigurationUri $dscUri -GalleryImageDefinitionId $imageDefId -WhatIf
 #>
@@ -117,20 +110,11 @@ param(
     [string]$LocalAdminUsername = 'avdlocaladmin',
     [ValidateSet('StandardSSD_LRS', 'Premium_LRS')][string]$OsDiskSku = 'StandardSSD_LRS',
     [ValidateRange(30, 1440)][int]$RegistrationTokenLifetimeMinutes = 1440,
-    [string]$WhatIfReportPath,
-    [string]$PowerOffIdentityId = ''
+    [string]$WhatIfReportPath
 )
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
-
-# Azure DevOps leaves an undefined $(VARIABLE_NAME) macro unchanged; treat it
-# as absent so a variable group without the power-off identity still builds.
-$PowerOffIdentityId = if ($PowerOffIdentityId -match '^\$\([A-Za-z0-9_.-]+\)$') { '' } else { $PowerOffIdentityId.Trim() }
-if ($PowerOffIdentityId -and
-    $PowerOffIdentityId -notmatch '\A/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.ManagedIdentity/userAssignedIdentities/[^/]+\z') {
-    throw "PowerOffIdentityId '$PowerOffIdentityId' is not a user-assigned managed identity resource ID."
-}
 
 function Invoke-AzCliJson {
     param([Parameter(Mandatory)][string[]]$ArgumentList)
@@ -275,7 +259,6 @@ try {
             localAdminUsername = @{ value = $LocalAdminUsername }
             localAdminPassword = @{ value = (Get-RandomPassword) }
             osDiskSku = @{ value = $OsDiskSku }
-            powerOffIdentityId = @{ value = $PowerOffIdentityId }
         }
     }
     $parameters | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $parameterFile -Encoding utf8

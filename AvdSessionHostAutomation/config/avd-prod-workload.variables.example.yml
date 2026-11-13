@@ -46,14 +46,6 @@ variables:
   #           because Contributor cannot write role assignments.
   # Undefined or '' means Direct.
   AVD_USER_ACCESS_MODE: Group
-  # Idle power-off without access.bicep: resource ID of the workload's
-  # user-assigned managed identity, prepared once with VM read + deallocate
-  # over the session-host resource group (guide step 6). The Provision stage
-  # attaches it to each VM; Contributor can do that, and no role assignment is
-  # written. The Intune guest task must pass this identity's client ID.
-  # '' attaches nothing.
-  AVD_POWER_OFF_IDENTITY_ID: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example-sessionhosts/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-example-avd-poweroff
-  # Per-VM alternative to the shared identity above; use one or the other.
   # GUID output selfDeallocateRoleDefinitionId of access.bicep. When set, the
   # Assign stage grants each VM's system-assigned identity this role on its
   # own VM so the guest idle task can deallocate it. '' disables the grant.

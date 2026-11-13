@@ -71,9 +71,6 @@ param osDiskSku string = 'StandardSSD_LRS'
 @description('Enable accelerated networking only when the selected VM SKU supports it.')
 param acceleratedNetworking bool = true
 
-@description('Optional resource ID of a workload user-assigned managed identity that already holds VM read and deallocate rights over the session-host resource group. Attached alongside the system-assigned identity so the guest idle task can power the VM off. Empty attaches nothing. Attaching needs only Microsoft.ManagedIdentity/userAssignedIdentities/assign/action, which Contributor holds; no role assignment is written.')
-param powerOffIdentityId string = ''
-
 @description('Additional tags. Required lifecycle tags cannot be overridden.')
 param tags object = {}
 
@@ -127,18 +124,9 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-03-01' = {
   name: vmName
   location: location
   tags: effectiveTags
-  // The system-assigned identity is always kept. The shared power-off
-  // identity is added only when configured.
-  identity: empty(powerOffIdentityId)
-    ? {
-        type: 'SystemAssigned'
-      }
-    : {
-        type: 'SystemAssigned, UserAssigned'
-        userAssignedIdentities: {
-          '${powerOffIdentityId}': {}
-        }
-      }
+  identity: {
+    type: 'SystemAssigned'
+  }
   properties: {
     licenseType: 'Windows_Client'
     hardwareProfile: {

@@ -133,7 +133,7 @@ write role assignments. Decide first whether this step applies:
 
 | `AVD_USER_ACCESS_MODE` | `AVD_SELF_DEALLOCATE_ROLE_ID` | Step 4.3 |
 |---|---|---|
-| `Group` | `''` | **Skip it.** The build makes no role grants. For idle power-off, use the shared identity from step 6. |
+| `Group` | `''` (idle self-deallocate off) | **Skip it.** The build makes no role grants. |
 | `Group` | set | Required, for the per-VM self-deallocate grant. |
 | `Direct` | either | Required, for the end-user grants. |
 
@@ -194,9 +194,6 @@ and desktop roles (Direct mode) or the VM's self-deallocate role.
      build grant the roles per user;
    - set `AVD_SELF_DEALLOCATE_ROLE_ID` to the GUID from step 4.3, or `''`
      when step 4.3 was skipped;
-   - set `AVD_POWER_OFF_IDENTITY_ID` to the shared power-off identity's
-     resource ID from step 6, or `''` when that model is not used. Step 6
-     comes later in this guide, so fill this in once the identity exists;
    - set `AVD_REQUIRED_APP_NAMES_JSON` to the exact installed DisplayNames of
      the base applications, for example `["App One","App Two"]`. Use the full
      names, not substrings. `[]` disables the app gate.
@@ -222,72 +219,16 @@ can wait.
    `9cdead84-a844-4324-93f2-b2e6bb768d07`) at **subscription** scope. The
    commands are in section 8.1 of the access doc; Microsoft documents that a
    lower scope breaks the feature.
-2. **Idle power-off identity.** Pick one model per workload:
-
-   - **Shared identity (use this when step 4.3 was skipped).** One
-     user-assigned managed identity per workload, prepared once and attached
-     to every VM by the build. Attaching needs only Contributor, so the build
-     still writes no role assignments.
-   - **Per-VM identity (needs step 4.3).** Set `AVD_SELF_DEALLOCATE_ROLE_ID`;
-     the build grants each VM's own system-assigned identity the role on that
-     VM only. Leave `AVD_POWER_OFF_IDENTITY_ID` as `''`.
-
-   **Workload prep for the shared identity.** The identity can be created
-   with Contributor. Creating the role and its assignment needs
-   `roleDefinitions/write` and `roleAssignments/write`, once per workload,
-   never per build:
-
-   ```powershell
-   # 1. Create the identity in the session-host resource group. Record all three values.
-   az identity create --resource-group <vm-rg> --name id-avd-<workload>-poweroff `
-       --query '{id:id, clientId:clientId, principalId:principalId}'
-
-   # 2. Custom role with only VM read and deallocate, assignable only to that
-   #    resource group. Save as poweroff-role.json first:
-   #    {
-   #      "Name": "AVD Prod Power Off <workload>",
-   #      "IsCustom": true,
-   #      "Description": "VM read and deallocate only, for the idle power-off identity.",
-   #      "Actions": [
-   #        "Microsoft.Compute/virtualMachines/read",
-   #        "Microsoft.Compute/virtualMachines/deallocate/action"
-   #      ],
-   #      "NotActions": [],
-   #      "AssignableScopes": [ "/subscriptions/<subscription-id>/resourceGroups/<vm-rg>" ]
-   #    }
-   az role definition create --role-definition '@poweroff-role.json'
-
-   # 3. Assign it to the identity at the session-host resource group.
-   az role assignment create --assignee-object-id <principalId> `
-       --assignee-principal-type ServicePrincipal `
-       --role 'AVD Prod Power Off <workload>' `
-       --scope /subscriptions/<subscription-id>/resourceGroups/<vm-rg>
-   ```
-
-   Then set `AVD_POWER_OFF_IDENTITY_ID` in the workload variable group to the
-   identity's `id`, and give its `clientId` to the Intune team for step 3.
-
-   **Scope and role choice.** Every host carries this identity, and any code
-   running as SYSTEM or local administrator on a host can request its token
-   from IMDS. Whatever the identity can do, any one compromised host can do
-   to every VM in scope. So:
-
-   - assign at the **session-host resource group**, not the subscription;
-   - do not use the built-in *Desktop Virtualization Power On Off
-     Contributor* role. Besides deallocate, it includes host-pool and
-     session-host writes, user-session delete (signing users off), and
-     `Microsoft.Resources/deployments/*`.
-
-   The worst case with the custom role is that every desktop in the resource
-   group is powered off. Nothing can be deleted, and Start VM on Connect
-   brings each desktop back when its user connects.
+2. **Idle self-deallocate:** nothing to do in Azure. The provision pipeline
+   grants each VM's identity the role at build time when
+   `AVD_SELF_DEALLOCATE_ROLE_ID` is set. If step 4.3 was skipped, the
+   variable is `''`, no VM gets the role, and idle power-off is off: the
+   guest task below would find no permission to deallocate. Hosts then stay
+   running until stopped some other way.
 3. **Guest task (Intune):** the Intune team deploys
    [../endpoint/Invoke-AvdSelfDeallocate.ps1](../endpoint/Invoke-AvdSelfDeallocate.ps1)
    to the AVD device group as a scheduled task running as SYSTEM, for example
-   every 15 minutes. With the shared identity, the task must pass
-   `-ManagedIdentityClientId <clientId>`. The VM also has a system-assigned
-   identity, and without the client ID the token could come from that
-   identity, which has no power-off rights.
+   every 15 minutes.
 
    **Gap: the installer is not in this repository yet.** Intune has no
    native scheduled-task payload, so the task needs a wrapper: a Win32 app or
@@ -420,11 +361,8 @@ Run in this order, using a test RITM number and a licensed test user:
      network or host pool;
    - the Readiness stage's run summary shows every gate passed;
    - the user can sign in to the desktop;
-   - with the shared power-off identity, the VM's **Identity > User
-     assigned** blade lists it, and its **System assigned** identity is
-     still on;
-   - with the per-VM model, the VM identity holds `AVD Prod Self Deallocate`
-     on its own VM;
+   - when self-deallocate is configured, the VM identity holds
+     `AVD Prod Self Deallocate` on its own VM;
    - in Group mode, the build created no role assignment for the user.
 4. **Power cycle** (after the Intune wrapper exists): leave the desktop idle
    with the user signed out; confirm it deallocates after the threshold and
@@ -439,8 +377,7 @@ Run in this order, using a test RITM number and a licensed test user:
 1. If step 4.3 applies to the new workload, the elevated administrator
    deploys `access.bicep` for it and records its self-deallocate role GUID.
    In Group mode, confirm the workload's Entra group holds the two roles
-   over its session-host resource group and application group instead, and
-   run the shared power-off identity prep from step 6 for its resource group.
+   over its session-host resource group and application group instead.
 2. Create `avd-prod-<workload>` (step 5.1) and authorize the provision
    pipeline for it (step 8.1).
 3. Pull request: add the name to the YAML `values` list (step 7).

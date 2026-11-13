@@ -156,52 +156,6 @@ Describe 'New-AvdSessionHost' {
             Should -Invoke az -Times 0 -Exactly
         }
     }
-
-    Context 'Power-off identity' {
-        BeforeEach {
-            # A real (non -WhatIf) run writes the parameter file, so the
-            # what-if mock copies it to TestDrive before the script deletes
-            # it, and each test reads back exactly what the template receives.
-            $script:capturedParameterFile = Join-Path $TestDrive 'template-parameters.json'
-            Remove-Item -LiteralPath $script:capturedParameterFile -ErrorAction SilentlyContinue
-            Mock az {
-                $global:LASTEXITCODE = 0
-                $command = $args -join ' '
-                switch -Wildcard ($command) {
-                    'account show*' { '{"id":"sub-1","tenantId":"tenant-1"}' }
-                    'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { '{"id":"user-1","userPrincipalName":"user@contoso.com","accountEnabled":true}' }
-                    'vm list*' { '[]' }
-                    'rest --method POST --url *retrieveRegistrationToken*' { '{"token":"fixture-token","expirationTime":"2099-01-01T00:00:00Z"}' }
-                    'deployment group what-if*' {
-                        $parameterArgument = @($args | Where-Object { "$_" -like '@*' })[0]
-                        Copy-Item -LiteralPath "$parameterArgument".Substring(1) -Destination (Join-Path $TestDrive 'template-parameters.json')
-                        '{"changes":[]}'
-                    }
-                    'deployment group create*' { '{"properties":{"outputs":{"vmId":{"value":"/vm-1"}}}}' }
-                    default { throw "Unexpected az call in test: az $command" }
-                }
-            }
-            $script:powerOffIdentityId = '/subscriptions/sub-1/resourceGroups/rg-hosts/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-avd-poweroff'
-        }
-
-        It 'passes the identity resource ID to the template when set' {
-            & $script:deployScript @script:deployArguments -PowerOffIdentityId $script:powerOffIdentityId *>&1 | Out-Null
-            $captured = (Get-Content -LiteralPath $script:capturedParameterFile -Raw | ConvertFrom-Json).parameters
-            $captured.powerOffIdentityId.value | Should -Be $script:powerOffIdentityId
-        }
-
-        It 'passes an empty value when the variable macro is unresolved' {
-            & $script:deployScript @script:deployArguments -PowerOffIdentityId '$(AVD_POWER_OFF_IDENTITY_ID)' *>&1 | Out-Null
-            $captured = (Get-Content -LiteralPath $script:capturedParameterFile -Raw | ConvertFrom-Json).parameters
-            $captured.powerOffIdentityId.value | Should -Be ''
-        }
-
-        It 'rejects a value that is not a user-assigned identity resource ID before any Azure call' {
-            { & $script:deployScript @script:deployArguments -PowerOffIdentityId '/subscriptions/sub-1/resourceGroups/rg-hosts/providers/Microsoft.Compute/virtualMachines/AVD1' -WhatIf *>&1 | Out-Null } |
-                Should -Throw '*not a user-assigned managed identity resource ID*'
-            Should -Invoke az -Times 0 -Exactly
-        }
-    }
 }
 
 Describe 'Wait-AvdReadiness' {
@@ -589,11 +543,6 @@ Describe 'Provision pipeline' {
         $script:pipeline.IndexOf('Set-AvdPersonalDesktopAssignment.ps1') | Should -BeGreaterThan $script:pipeline.IndexOf('Wait-AvdReadiness.ps1')
     }
 
-    It 'passes the workload power-off identity to the deployment script' {
-        $script:pipeline | Should -Match 'POWER_OFF_IDENTITY_ID: \$\(AVD_POWER_OFF_IDENTITY_ID\)'
-        $script:pipeline | Should -Match '-PowerOffIdentityId \$env:POWER_OFF_IDENTITY_ID'
-    }
-
     It 'passes the workload user access mode to the assignment script' {
         $script:pipeline | Should -Match 'USER_ACCESS_MODE: \$\(AVD_USER_ACCESS_MODE\)'
         $script:pipeline | Should -Match '-UserAccessMode \$env:USER_ACCESS_MODE'
@@ -626,14 +575,6 @@ Describe 'Infrastructure safety' {
     It 'session host carries the production lifecycle tags' {
         $script:sessionHost | Should -Match "ManagedBy: 'AvdProduction'"
         $script:sessionHost | Should -Match 'RITM: ritmNumber'
-    }
-
-    It 'session host keeps the system-assigned identity and adds the power-off identity only when set' {
-        $script:sessionHost | Should -Match "(?s)identity: empty\(powerOffIdentityId\)\s*\?\s*\{\s*type: 'SystemAssigned'\s*\}"
-        $script:sessionHost | Should -Match "type: 'SystemAssigned, UserAssigned'"
-        $script:sessionHost | Should -Not -Match "type: 'UserAssigned'"
-        # Attaching the identity must never become a role assignment here.
-        $script:sessionHost | Should -Not -Match 'Microsoft\.Authorization/roleAssignments'
     }
 
     It 'access roles grant no delete action or network write' {
@@ -744,23 +685,5 @@ Describe 'Invoke-AvdSelfDeallocate' {
     It 'never writes the token to output' {
         $output = & $script:selfDeallocate *>&1 | Out-String
         $output | Should -Not -BeLike '*fixture-token*'
-    }
-
-    It 'requests the token without client_id when no identity is named' {
-        & $script:selfDeallocate *>&1 | Out-Null
-        Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -match 'oauth2/token' -and $Uri -notmatch 'client_id=' }
-    }
-
-    It 'requests the token for the named user-assigned identity' {
-        & $script:selfDeallocate -ManagedIdentityClientId '11111111-1111-1111-1111-111111111111' *>&1 | Out-Null
-        Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
-            $Uri -match 'oauth2/token' -and $Uri -like '*&client_id=11111111-1111-1111-1111-111111111111'
-        }
-        Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'Post' }
-    }
-
-    It 'rejects a client ID that is not a GUID before any call' {
-        { & $script:selfDeallocate -ManagedIdentityClientId 'not-a-guid&resource=x' } | Should -Throw
-        Should -Invoke Invoke-RestMethod -Times 0 -Exactly
     }
 }

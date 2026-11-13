@@ -39,7 +39,6 @@ roles on top of its Contributor grant.
 | Technicians | Human Azure DevOps users | None | Azure DevOps `Queue builds` on this pipeline only | Start builds by hand while the ServiceNow automation is behind |
 | Azure Virtual Desktop service principal (app ID `9cdead84-a844-4324-93f2-b2e6bb768d07`) | Microsoft first-party service principal, already in the tenant | Built-in **Desktop Virtualization Power On Contributor** at subscription scope (Microsoft documents that any lower scope breaks Start VM on Connect) | None | Lets the AVD control plane start a deallocated personal host when its user connects (section 8.1) |
 | Session-host VM identity | System-assigned managed identity, already created per VM by the Bicep; the build's Assign stage grants the role | Custom `AVD Prod Self Deallocate` (VM read + deallocate only) at the VM's own scope | None | The Intune-deployed guest task deallocates its own idle VM through IMDS (section 8.3) |
-| Shared power-off identity (alternative to the row above) | User-assigned managed identity, one per workload, created during workload prep and attached to each VM by the build | Custom `AVD Prod Power Off <workload>` (VM read + deallocate only) at the session-host resource group | None | Same guest task, for workloads that do not deploy `access.bicep` (section 8.4) |
 
 All Azure identities authenticate with **workload identity federation**
 (no client secrets to store or rotate) and each service connection is
@@ -85,9 +84,8 @@ shared connection:**
    *Desktop Virtualization User* on the application group, set
    `AVD_USER_ACCESS_MODE` to `Group`. The Assign stage then makes no user
    grants. If `AVD_SELF_DEALLOCATE_ROLE_ID` is also `''`, the build writes no
-   role assignments at all, and `access.bicep` is not needed. Idle power-off
-   then uses the shared identity in section 8.4, whose one-time role setup
-   is the only elevated action left.
+   role assignments at all, and neither `access.bicep` nor the elevated
+   administrator is needed. The cost is no idle self-deallocate (section 8.3).
 2. **Microsoft Graph application permissions.** Azure RBAC grants no Graph
    access at any tier. The app registration behind the shared connection
    needs the union of the permissions in the quick reference: `User.Read.All`,
@@ -422,36 +420,6 @@ For session hosts built before this was enabled, run the Assign stage's
 grant once per existing VM (or re-run the pipeline for the RITM), since the
 role grant normally happens at build time.
 
-### 8.4 Alternative: shared user-assigned power-off identity
-
-For workloads that skip `access.bicep` (group-based user access on the
-shared Contributor connection), the build cannot grant a role to each new
-VM. Instead:
-
-- During workload prep, one user-assigned managed identity is created and
-  given a custom role with only `Microsoft.Compute/virtualMachines/read` and
-  `Microsoft.Compute/virtualMachines/deallocate/action` at the session-host
-  resource group. The commands are in step 6 of the deployment guide.
-- `AVD_POWER_OFF_IDENTITY_ID` holds its resource ID. The Provision stage
-  attaches it to each VM next to the system-assigned identity. Attaching
-  needs `Microsoft.ManagedIdentity/userAssignedIdentities/assign/action`,
-  which Contributor holds; no role assignment is written at build time.
-- The guest task runs with `-ManagedIdentityClientId <clientId>`, so the
-  IMDS token is always requested for this identity.
-
-**Trade-off, stated for the approvers.** Microsoft documents that any code
-on a VM can get tokens for every managed identity attached to it. With the
-shared identity, any one host, through anyone holding SYSTEM or local
-administrator on it, can deallocate every VM in the resource group. The
-guest script only targets its own VM, but that is a code control, not an
-RBAC one. Keep the role to read + deallocate and the scope to the
-session-host resource group. Do not use the built-in *Desktop Virtualization
-Power On Off Contributor* role: it also grants host-pool and session-host
-writes, user-session delete, and `Microsoft.Resources/deployments/*`.
-Deallocate deletes nothing, and Start VM on Connect restarts each desktop
-when its user connects.
-https://learn.microsoft.com/entra/identity/managed-identities-azure-resources/how-to-use-vm-token
-
 ## 9. Copy/paste request templates
 
 Never request a secret, PAT, password, or OAuth client secret by email or
@@ -489,19 +457,12 @@ Subscription: <subscription-id>
    object ID (az ad sp show --id 9cdead84-a844-4324-93f2-b2e6bb768d07
    --query id -o tsv); the portal picker shows object IDs only.
 Items 2 and 3 apply only when access.bicep is deployed. Omit them for a
-workload using group-based user access with self-deallocate off, and use
-item 4 instead for idle power-off.
+workload using group-based user access with self-deallocate off.
 
 2. Provide a PIM/JIT elevation for <administrator> to deploy infra/access.bicep
    at resource groups <vm-rg>, <host-pool-rg>, <network-rg>, then remove it.
 3. Confirm the eight custom roles created by access.bicep contain no delete
    action, and the two assignment roles carry the ABAC condition.
-4. Shared power-off identity, once per workload: create the custom role
-   "AVD Prod Power Off <workload>" with only
-   Microsoft.Compute/virtualMachines/read and
-   Microsoft.Compute/virtualMachines/deallocate/action, assignable only to
-   <vm-rg>, and assign it to user-assigned identity <identity-name>
-   (principal ID <principal-id>) at <vm-rg>. Not at subscription scope.
 
 Return role-assignment IDs and scopes. Send no secrets.
 ```
@@ -553,9 +514,7 @@ Device group: <group-name/id>
 Configure automatic MDM enrollment, compliance and configuration profiles,
 required applications, Defender for Endpoint onboarding, and a recurring
 scheduled task running endpoint/Invoke-AvdSelfDeallocate.ps1 (for example every
-15 minutes, as SYSTEM) for the AVD device group. If the workload uses the
-shared power-off identity, the task arguments must include
--ManagedIdentityClientId <power-off-identity-client-id>.
+15 minutes, as SYSTEM) for the AVD device group.
 
 Return policy and app IDs and assignment status. No secrets.
 ```
