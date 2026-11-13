@@ -355,7 +355,24 @@ Run in this order, using a test RITM number and a licensed test user:
 2. **What-if from the launcher**: `Start-AvdBuild.ps1 ... -WhatIf`. It
    compiles the run with your values (a preview) and starts nothing. This
    catches YAML errors and an unknown workload name early.
-3. **Technician-mode build**: queue for real. Confirm:
+3. **Azure what-if from your own session**: copy
+   [../examples/Invoke-AvdDryRun.example.ps1](../examples/Invoke-AvdDryRun.example.ps1)
+   to `examples/Invoke-AvdDryRun.ps1` (git-ignored), replace every
+   `<PLACEHOLDER>` with the value from the workload variable group, then, in
+   PowerShell 7.2 or later after `az login --tenant <tenant-id>`:
+
+   ```powershell
+   ./examples/Invoke-AvdDryRun.ps1 -RitmNumber RITM0012345 -RequestedForUpn testuser@contoso.com
+   ```
+
+   It runs the Provision stage's checks and the real ARM what-if, always with
+   `-WhatIf`, so it never renews the token or deploys. It passes only when the
+   VM, NIC, and two extensions are creates, nothing else changes, and the NIC
+   has no public IP. It runs as you, not the service connection: ARM what-if
+   needs the same rights as the deployment (Contributor on the session-host
+   resource group is enough) plus Graph read on the user. The report holds
+   tenant resource IDs and is written to your temp folder; delete it after.
+4. **Technician-mode build**: queue for real. Confirm:
    - the Provision stage's `session-host-what-if.json` artifact shows only
      creates for the VM, NIC, disk, and extensions, with nothing touching the
      network or host pool;
@@ -364,12 +381,12 @@ Run in this order, using a test RITM number and a licensed test user:
    - when self-deallocate is configured, the VM identity holds
      `AVD Prod Self Deallocate` on its own VM;
    - in Group mode, the build created no role assignment for the user.
-4. **Power cycle** (after the Intune wrapper exists): leave the desktop idle
+5. **Power cycle** (after the Intune wrapper exists): leave the desktop idle
    with the user signed out; confirm it deallocates after the threshold and
    starts again when the user connects.
-5. **Failure path**: queue with a disabled or nonexistent test UPN. The build
+6. **Failure path**: queue with a disabled or nonexistent test UPN. The build
    should fail in Provision before any VM is created.
-6. **ServiceNow mode** (when live): queue from a test RITM; confirm the RITM
+7. **ServiceNow mode** (when live): queue from a test RITM; confirm the RITM
    moves through In Progress to Ready with the hostname written back.
 
 ## 13. Adding a workload later

@@ -243,7 +243,10 @@ if ([string]::IsNullOrWhiteSpace($registrationToken) -or $tokenExpiration -lt [D
         $registrationToken = 'whatif-placeholder-token'
     }
 }
-if ($registrationToken -cne 'whatif-placeholder-token') {
+# setsecret masks the token only inside Azure DevOps (TF_BUILD is set on every
+# agent). Anywhere else the line would just print the token, so it is skipped.
+# https://learn.microsoft.com/azure/devops/pipelines/build/variables#system-variables
+if ($registrationToken -cne 'whatif-placeholder-token' -and $env:TF_BUILD -ieq 'True') {
     Write-Output "##vso[task.setsecret]$registrationToken"
 }
 

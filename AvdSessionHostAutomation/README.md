@@ -124,6 +124,8 @@ Details and rationale in section 8 of
 ├── docs/
 │   ├── DEPLOYMENT-GUIDE.md               Azure DevOps setup, pipelines, acceptance
 │   └── SERVICE-ACCOUNTS-AND-PERMISSIONS.md   the full access request
+├── examples/
+│   └── Invoke-AvdDryRun.example.ps1    ARM what-if dry run from your own session (copy, fill, run)
 ├── endpoint/                           guest scripts delivered by Intune (PowerShell 5.1)
 │   ├── Invoke-AvdSelfDeallocate.ps1
 │   └── PSScriptAnalyzerSettings.psd1
@@ -149,6 +151,7 @@ Details and rationale in section 8 of
 │   ├── Start-AvdBuild.ps1
 │   └── Start-AvdBuild.settings.example.json
 └── tests/
+    ├── Invoke-AvdDryRun.Tests.ps1      dry-run template
     ├── Production.Tests.ps1            scripts, pipeline, and Bicep safety
     └── Start-AvdBuild.Tests.ps1        launcher
 ```

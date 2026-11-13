@@ -102,6 +102,28 @@ Describe 'New-AvdSessionHost' {
             Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*--method PATCH*' }
         }
 
+        # Regression: a local run printed the real registration token, because
+        # the ##vso setsecret line only masks anything inside Azure DevOps.
+        It 'never prints the registration token outside Azure DevOps' {
+            $previous = $env:TF_BUILD
+            try {
+                $env:TF_BUILD = $null
+                $output = & $script:deployScript @script:deployArguments -WhatIf *>&1 | Out-String
+                $output | Should -Not -BeLike '*fixture-token*'
+            }
+            finally { $env:TF_BUILD = $previous }
+        }
+
+        It 'masks the registration token on an Azure DevOps agent' {
+            $previous = $env:TF_BUILD
+            try {
+                $env:TF_BUILD = 'True'
+                $output = & $script:deployScript @script:deployArguments -WhatIf *>&1 | Out-String
+                $output | Should -BeLike '*##vso`[task.setsecret`]fixture-token*'
+            }
+            finally { $env:TF_BUILD = $previous }
+        }
+
         It 'does not renew the registration token' {
             Mock az {
                 $global:LASTEXITCODE = 0

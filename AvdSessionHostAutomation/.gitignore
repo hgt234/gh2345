@@ -9,6 +9,9 @@ CLAUDE.local.md
 # Holds the real Azure DevOps organization and project names
 technician/Start-AvdBuild.settings.json
 
+# Filled-in copy of the dry-run template; holds real subscription and resource IDs
+examples/Invoke-AvdDryRun.ps1
+
 # Real variable-group files; only the *.example.yml templates are tracked
 *.variables.yml
 !*.variables.example.yml
