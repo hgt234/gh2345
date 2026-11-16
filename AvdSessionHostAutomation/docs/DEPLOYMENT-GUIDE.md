@@ -225,16 +225,55 @@ can wait.
    variable is `''`, no VM gets the role, and idle power-off is off: the
    guest task below would find no permission to deallocate. Hosts then stay
    running until stopped some other way.
-3. **Guest task (Intune):** the Intune team deploys
-   [../endpoint/Invoke-AvdSelfDeallocate.ps1](../endpoint/Invoke-AvdSelfDeallocate.ps1)
-   to the AVD device group as a scheduled task running as SYSTEM, for example
-   every 15 minutes.
+3. **Guest scripts (Intune Remediations):** the Intune team creates one
+   script package. Remediations need each user of the devices to hold
+   Windows Enterprise E3 or E5, Windows Education A3 or A5, or Windows VDA
+   per user; AVD users normally already do.
+   1. In the Intune admin center, go to **Devices** > **Manage devices** >
+      **Scripts and remediations** > **Create script package**. Name it, for
+      example, `AVD - Self deallocate when idle`.
+   2. Upload the files rather than pasting them, so the encoding stays
+      UTF-8:
+      - **Detection script file:**
+        [../endpoint/Detect-AvdSelfDeallocate.ps1](../endpoint/Detect-AvdSelfDeallocate.ps1)
+      - **Remediation script file:**
+        [../endpoint/Invoke-AvdSelfDeallocate.ps1](../endpoint/Invoke-AvdSelfDeallocate.ps1)
+   3. Settings:
+      - **Run this script using the logged-on credentials:** No (runs as
+        SYSTEM).
+      - **Enforce script signature check:** No.
+      - **Run script in 64-bit PowerShell:** Yes. Both scripts must run in
+        the same 64-bit view of the registry, where the remediation leaves
+        its marker for the detection script.
+   4. Assign it to the AVD session-host device group with schedule
+      **Hourly**, repeating every **1** hour.
 
-   **Gap: the installer is not in this repository yet.** Intune has no
-   native scheduled-task payload, so the task needs a wrapper: a Win32 app or
-   platform script that copies the script to a protected local path,
-   registers the task, and has a detection rule. Build and pilot that wrapper
-   before relying on idle power-off.
+   How it behaves: detection exits 1 only when the host has no session
+   (active or disconnected) and has been up at least 60 minutes. Intune then
+   runs the remediation, which re-checks both gates before deallocating, so
+   a user who connects in between is not cut off. An idle host therefore
+   deallocates within about an hour of qualifying. Intune runs detection
+   again after the remediation; while the VM shuts down, it reports
+   "Deallocation accepted ... waiting for Azure" (exit 0). Detection exit 2
+   means detection itself failed; the output column shows why.
+
+   Intune passes no parameters to these scripts, so the 60-minute threshold
+   is the `MinimumUptimeMinutes` default in both files. Change both
+   together; the CI Pester suite fails if they differ.
+
+   Pilot first: on one host, run the remediation script with `-WhatIf` from
+   an elevated prompt. It tests the managed identity and its role without
+   deallocating, even while you are signed in:
+
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-AvdSelfDeallocate.ps1 -WhatIf
+   ```
+
+   "Identity check passed" means the VM's identity is enabled and holds the
+   self-deallocate role on that VM. Run the whole file: running a selection
+   skips the parameter defaults. Hosts fetch Remediations policy at startup
+   and every 8 hours, so allow time for the assignment to arrive, or use the
+   device's **Run remediation (preview)** action to run it on demand.
 
 ## 7. Set the workload list in the pipeline YAML
 
@@ -381,8 +420,10 @@ Run in this order, using a test RITM number and a licensed test user:
    - when self-deallocate is configured, the VM identity holds
      `AVD Prod Self Deallocate` on its own VM;
    - in Group mode, the build created no role assignment for the user.
-5. **Power cycle** (after the Intune wrapper exists): leave the desktop idle
-   with the user signed out; confirm it deallocates after the threshold and
+5. **Power cycle** (after the step 6 Remediations package is assigned):
+   leave the desktop idle with the user signed out; confirm it deallocates
+   within about an hour of passing the 60-minute uptime threshold, that the
+   package's device status shows the remediation ran, and that the desktop
    starts again when the user connects.
 6. **Failure path**: queue with a disabled or nonexistent test UPN. The build
    should fail in Provision before any VM is created.

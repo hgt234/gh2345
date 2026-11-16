@@ -102,13 +102,16 @@ Details and rationale in section 8 of
   (`AVD_SELF_DEALLOCATE_ROLE_ID` in the variable group enables this). It
   needs `access.bicep`, so a workload that skips that deployment has no idle
   power-off.
-- [endpoint/Invoke-AvdSelfDeallocate.ps1](endpoint/Invoke-AvdSelfDeallocate.ps1)
-  runs on each host as SYSTEM via an Intune scheduled task. If any session
-  exists - active or disconnected - it exits; otherwise, once uptime passes
-  the threshold, it verifies its own identity through IMDS and deallocates
-  itself. Deallocate, not shutdown, is what stops compute billing.
-  The Intune installer wrapper (Win32 app or platform script that registers
-  the task) is not in this repository yet; see step 6 of the deployment
+- An Intune Remediations script package runs hourly on each host as SYSTEM.
+  [endpoint/Detect-AvdSelfDeallocate.ps1](endpoint/Detect-AvdSelfDeallocate.ps1)
+  is the read-only detection script: it reports the host idle when no
+  session exists (active or disconnected) and uptime has passed the
+  threshold.
+  [endpoint/Invoke-AvdSelfDeallocate.ps1](endpoint/Invoke-AvdSelfDeallocate.ps1)
+  is the remediation script: it re-checks those gates, verifies its own
+  identity through IMDS, and deallocates itself. Deallocate, not shutdown,
+  is what stops compute billing. Run it with `-WhatIf` on a host to test the
+  identity and role without deallocating. Setup is step 6 of the deployment
   guide.
 
 ## Folder map
@@ -127,7 +130,8 @@ Details and rationale in section 8 of
 ├── examples/
 │   └── Invoke-AvdDryRun.example.ps1    ARM what-if dry run from your own session (copy, fill, run)
 ├── endpoint/                           guest scripts delivered by Intune (PowerShell 5.1)
-│   ├── Invoke-AvdSelfDeallocate.ps1
+│   ├── Detect-AvdSelfDeallocate.ps1    Remediations detection script (read-only)
+│   ├── Invoke-AvdSelfDeallocate.ps1    Remediations remediation script
 │   └── PSScriptAnalyzerSettings.psd1
 ├── infra/
 │   ├── access.bicep                    custom roles and assignments (admin, once per workload)

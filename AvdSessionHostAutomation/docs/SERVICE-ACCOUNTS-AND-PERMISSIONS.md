@@ -399,22 +399,25 @@ prior organization. This is implemented in the repository:
   variable group. The build's Assign stage then grants each new VM's
   **existing system-assigned managed identity** the role on that VM only.
   Blast radius per identity: one machine can turn itself off.
-- [endpoint/Invoke-AvdSelfDeallocate.ps1](../endpoint/Invoke-AvdSelfDeallocate.ps1)
-  runs on the host as SYSTEM via an Intune-deployed scheduled task (for
-  example every 15 minutes). If any session exists - active or disconnected,
-  so nobody's running applications are lost - it exits. Otherwise, once the
-  VM has been up past the idle threshold, it reads its own compute metadata
-  and a management token from IMDS (link-local, no stored credential),
-  verifies the metadata names this machine, and calls deallocate on itself.
-  Deallocate, not guest shutdown, is what releases compute billing.
+- An Intune Remediations script package runs hourly on the host as SYSTEM.
+  The detection script,
+  [endpoint/Detect-AvdSelfDeallocate.ps1](../endpoint/Detect-AvdSelfDeallocate.ps1),
+  is read-only: if any session exists - active or disconnected, so nobody's
+  running applications are lost - or the VM has not been up past the idle
+  threshold, it reports nothing to do. Otherwise the remediation script,
+  [endpoint/Invoke-AvdSelfDeallocate.ps1](../endpoint/Invoke-AvdSelfDeallocate.ps1),
+  re-checks those gates, reads its own compute metadata and a management
+  token from IMDS (link-local, no stored credential), verifies the metadata
+  names this machine, and calls deallocate on itself. Deallocate, not guest
+  shutdown, is what releases compute billing.
 
 **What we are asking for (summary):** nothing beyond what the pipeline
 request already contains - the role definition arrives with the one-time
 `access.bicep` deployment, the per-VM grants are made by the existing
 assignment identity under its ABAC condition, and the Intune team deploys
-the scheduled task alongside the other device policies.
-Intune has no native scheduled-task payload, so the task needs a Win32 app or
-platform-script wrapper; that wrapper is not in this repository yet.
+the Remediations script package alongside the other device policies (step 6
+of the deployment guide). Remediations need each user to hold Windows
+Enterprise E3 or E5, Windows Education A3 or A5, or Windows VDA per user.
 
 For session hosts built before this was enabled, run the Assign stage's
 grant once per existing VM (or re-run the pipeline for the RITM), since the
@@ -512,9 +515,11 @@ Request: AVD device policy
 Device group: <group-name/id>
 
 Configure automatic MDM enrollment, compliance and configuration profiles,
-required applications, Defender for Endpoint onboarding, and a recurring
-scheduled task running endpoint/Invoke-AvdSelfDeallocate.ps1 (for example every
-15 minutes, as SYSTEM) for the AVD device group.
+required applications, Defender for Endpoint onboarding, and a Remediations
+script package for the AVD device group: detection script
+endpoint/Detect-AvdSelfDeallocate.ps1, remediation script
+endpoint/Invoke-AvdSelfDeallocate.ps1, run as SYSTEM in 64-bit PowerShell,
+schedule Hourly every 1 hour.
 
 Return policy and app IDs and assignment status. No secrets.
 ```
