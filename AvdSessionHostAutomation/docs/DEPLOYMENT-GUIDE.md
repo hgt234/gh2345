@@ -248,18 +248,39 @@ can wait.
    4. Assign it to the AVD session-host device group with schedule
       **Hourly**, repeating every **1** hour.
 
-   How it behaves: detection exits 1 only when the host has no session
-   (active or disconnected) and has been up at least 60 minutes. Intune then
-   runs the remediation, which re-checks both gates before deallocating, so
-   a user who connects in between is not cut off. An idle host therefore
-   deallocates within about an hour of qualifying. Intune runs detection
-   again after the remediation; while the VM shuts down, it reports
-   "Deallocation accepted ... waiting for Azure" (exit 0). Detection exit 2
-   means detection itself failed; the output column shows why.
+   How it behaves:
+   - Detection exits 1 only when the host has no session (active or
+     disconnected) and has been up at least 60 minutes.
+   - Intune then runs the remediation. It re-checks both gates, proves the
+     VM's identity can read the VM, and schedules a one-time SYSTEM task
+     (`\AvdSessionHostAutomation\AvdSelfDeallocate`) for 10 minutes later.
+     It does not deallocate directly. If it did, the VM would stop before
+     Intune could upload the result.
+   - Intune runs detection again. It reports "Deallocation scheduled ..."
+     (exit 0), so the console shows the issue as fixed.
+   - When the task fires, it checks for sessions again. If a user connected
+     during the 10 minutes, it does nothing. Otherwise it deallocates the VM.
+   - An idle host therefore deallocates within about 70 minutes of
+     qualifying.
 
-   Intune passes no parameters to these scripts, so the 60-minute threshold
-   is the `MinimumUptimeMinutes` default in both files. Change both
-   together; the CI Pester suite fails if they differ.
+   The task runs a copy of the script that the remediation installs in
+   `C:\Program Files\AvdSessionHostAutomation`, a folder standard users
+   cannot write. The task cannot report to Intune itself. It records its
+   outcome (accepted, cancelled, or failed) in
+   `HKLM:\SOFTWARE\AvdSessionHostAutomation\SelfDeallocate\LastResult`, and
+   every detection output line ends with "Last self-deallocate: ...". The
+   outcome therefore shows in the console after the next detection run,
+   normally the first one after the user's next connection starts the VM.
+   Detection exit 2 means detection itself failed; the output column shows
+   why.
+
+   Intune passes no parameters to these scripts, so the configuration is in
+   the script defaults:
+   - The 60-minute threshold is `MinimumUptimeMinutes` in both files.
+     Change both together; the CI Pester suite fails if they differ.
+   - The 10-minute delay is `DeallocateDelayMinutes` in the remediation
+     script. The suite also checks that it stays at least 10 minutes below
+     the detection script's `MarkerValidMinutes` (30).
 
    Pilot first: on one host, run the remediation script with `-WhatIf` from
    an elevated prompt. It tests the managed identity and its role without
@@ -270,7 +291,8 @@ can wait.
    ```
 
    "Identity check passed" means the VM's identity is enabled and holds the
-   self-deallocate role on that VM. Run the whole file: running a selection
+   self-deallocate role on that VM. `-WhatIf` installs nothing, registers no
+   task, and writes no state. Run the whole file: running a selection
    skips the parameter defaults. Hosts fetch Remediations policy at startup
    and every 8 hours, so allow time for the assignment to arrive, or use the
    device's **Run remediation (preview)** action to run it on demand.
@@ -421,10 +443,13 @@ Run in this order, using a test RITM number and a licensed test user:
      `AVD Prod Self Deallocate` on its own VM;
    - in Group mode, the build created no role assignment for the user.
 5. **Power cycle** (after the step 6 Remediations package is assigned):
-   leave the desktop idle with the user signed out; confirm it deallocates
-   within about an hour of passing the 60-minute uptime threshold, that the
-   package's device status shows the remediation ran, and that the desktop
-   starts again when the user connects.
+   leave the desktop idle with the user signed out. Confirm:
+   - the package's device status shows the issue fixed, with post-remediation
+     detection output "Deallocation scheduled ...";
+   - the VM deallocates about 10 minutes later;
+   - the desktop starts again when the user connects;
+   - the next detection output ends with "Last self-deallocate: ...
+     accepted".
 6. **Failure path**: queue with a disabled or nonexistent test UPN. The build
    should fail in Provision before any VM is created.
 7. **ServiceNow mode** (when live): queue from a test RITM; confirm the RITM

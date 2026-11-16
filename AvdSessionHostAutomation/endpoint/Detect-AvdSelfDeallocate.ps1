@@ -14,33 +14,38 @@
     Exit codes:
       0  No action needed: a session exists (active or disconnected), the
          host has not been up MinimumUptimeMinutes yet, or a deallocation
-         was already accepted during this boot within the last
-         MarkerValidMinutes (the VM is shutting down).
+         was scheduled during this boot within the last MarkerValidMinutes.
       1  Idle: no sessions and past the uptime threshold. Intune then runs
          the remediation, which re-checks every gate before acting.
       2  Detection itself failed; the output line carries the reason.
          Any exit code other than 1 keeps the remediation from running.
 
-    The marker exists because Intune runs detection again right after the
-    remediation, while the VM is still shutting down. Without it, that
-    second run would see an idle host and report the issue as recurring.
-    The remediation writes the marker to HKLM, which standard users cannot
-    write. A marker from an earlier boot is ignored, and so is one older
-    than MarkerValidMinutes, so a deallocation that Azure accepted but never
-    carried out is retried on the next hourly run.
+    The remediation does not deallocate directly: it schedules a deferred
+    deallocation a few minutes out and writes a marker, so Intune can run
+    this script again and upload the result while the VM is still up. That
+    second run sees the marker and reports the issue as fixed. The marker
+    lives in HKLM, which standard users cannot write. A marker from an
+    earlier boot is ignored, and so is one older than MarkerValidMinutes,
+    so a deallocation that never happened is retried on the next hourly run.
+
+    Every output line ends with the last recorded self-deallocate result
+    (scheduled, accepted, cancelled, or failed), when there is one. The
+    deferred run itself cannot report to Intune, so this is where its
+    outcome reaches the console: in the detection output of the next run.
 
     Intune passes no parameters to Remediations scripts; the defaults are
-    the configuration. Keep MinimumUptimeMinutes, the marker key, and the
-    shared functions identical to Invoke-AvdSelfDeallocate.ps1 (the Pester
-    suite checks this).
+    the configuration. Keep MinimumUptimeMinutes, the registry names, and
+    the shared functions identical to Invoke-AvdSelfDeallocate.ps1 (the
+    Pester suite checks this).
 
 .PARAMETER MinimumUptimeMinutes
     Minimum minutes since boot before the host counts as idle. Must match
     Invoke-AvdSelfDeallocate.ps1.
 
 .PARAMETER MarkerValidMinutes
-    How long after an accepted deallocation detection keeps reporting
-    "already handled" during the same boot.
+    How long after the remediation schedules a deallocation detection keeps
+    reporting "already handled" during the same boot. Must exceed
+    DeallocateDelayMinutes in Invoke-AvdSelfDeallocate.ps1.
 
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Detect-AvdSelfDeallocate.ps1; $LASTEXITCODE
@@ -61,7 +66,8 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
 $markerKey = 'HKLM:\SOFTWARE\AvdSessionHostAutomation\SelfDeallocate'
-$markerValueName = 'DeallocateRequestedUtc'
+$markerValueName = 'DeallocateScheduledUtc'
+$resultValueName = 'LastResult'
 
 function Get-ActiveSessionCount {
     [CmdletBinding()]
@@ -88,50 +94,62 @@ function Get-HostUptime {
     return ((Get-Date) - $os.LastBootUpTime).TotalMinutes
 }
 
-function Get-DeallocateRequestTime {
+function Get-SelfDeallocateState {
     [CmdletBinding()]
-    [OutputType([Nullable[datetime]])]
+    [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)][string]$Key,
-        [Parameter(Mandatory)][string]$ValueName
+        [Parameter(Mandatory)][string]$MarkerName,
+        [Parameter(Mandatory)][string]$ResultName
     )
 
-    if (-not (Test-Path -LiteralPath $Key)) { return $null }
+    $state = [pscustomobject]@{ ScheduledUtc = $null; LastResult = $null }
+    if (-not (Test-Path -LiteralPath $Key)) { return $state }
     $item = Get-ItemProperty -LiteralPath $Key -ErrorAction SilentlyContinue
-    if (-not $item -or -not ($item.PSObject.Properties.Name -contains $ValueName)) { return $null }
-    $parsed = [datetime]::MinValue
-    $styles = [Globalization.DateTimeStyles]::RoundtripKind
-    if (-not [datetime]::TryParse([string]$item.$ValueName, [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
-        return $null
+    if (-not $item) { return $state }
+    $names = @($item.PSObject.Properties.Name)
+
+    if ($names -contains $ResultName -and $item.$ResultName) {
+        $state.LastResult = [string]$item.$ResultName
     }
-    return $parsed.ToUniversalTime()
+    if ($names -contains $MarkerName) {
+        $parsed = [datetime]::MinValue
+        $styles = [Globalization.DateTimeStyles]::RoundtripKind
+        if ([datetime]::TryParse([string]$item.$MarkerName, [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+            $state.ScheduledUtc = $parsed.ToUniversalTime()
+        }
+    }
+    return $state
 }
 
 try {
+    $state = Get-SelfDeallocateState -Key $markerKey -MarkerName $markerValueName -ResultName $resultValueName
+    $suffix = ''
+    if ($state.LastResult) { $suffix = " Last self-deallocate: $($state.LastResult)" }
+
     $sessionCount = Get-ActiveSessionCount
     if ($sessionCount -gt 0) {
-        Write-Output "In use: $sessionCount session(s) present."
+        Write-Output "In use: $sessionCount session(s) present.$suffix"
         exit 0
     }
 
     $uptimeMinutes = [Math]::Floor((Get-HostUptime))
     if ($uptimeMinutes -lt $MinimumUptimeMinutes) {
-        Write-Output "Up $uptimeMinutes of $MinimumUptimeMinutes minimum minutes."
+        Write-Output "Up $uptimeMinutes of $MinimumUptimeMinutes minimum minutes.$suffix"
         exit 0
     }
 
-    $requestedUtc = Get-DeallocateRequestTime -Key $markerKey -ValueName $markerValueName
-    if ($null -ne $requestedUtc) {
+    if ($null -ne $state.ScheduledUtc) {
         $nowUtc = (Get-Date).ToUniversalTime()
         $bootUtc = $nowUtc.AddMinutes(-$uptimeMinutes - 1)
-        $ageMinutes = [Math]::Floor(($nowUtc - $requestedUtc).TotalMinutes)
-        if ($requestedUtc -gt $bootUtc -and $ageMinutes -ge 0 -and $ageMinutes -lt $MarkerValidMinutes) {
-            Write-Output "Deallocation accepted $ageMinutes minute(s) ago; waiting for Azure to stop the VM."
+        $ageMinutes = [Math]::Floor(($nowUtc - $state.ScheduledUtc).TotalMinutes)
+        if ($state.ScheduledUtc -gt $bootUtc -and $ageMinutes -ge 0 -and $ageMinutes -lt $MarkerValidMinutes) {
+            Write-Output "Deallocation scheduled $ageMinutes minute(s) ago; the host deallocates itself unless a user connects first.$suffix"
             exit 0
         }
     }
 
-    Write-Output "Idle: 0 sessions, up $uptimeMinutes minutes."
+    Write-Output "Idle: 0 sessions, up $uptimeMinutes minutes.$suffix"
     exit 1
 }
 catch {

@@ -108,11 +108,14 @@ Details and rationale in section 8 of
   session exists (active or disconnected) and uptime has passed the
   threshold.
   [endpoint/Invoke-AvdSelfDeallocate.ps1](endpoint/Invoke-AvdSelfDeallocate.ps1)
-  is the remediation script: it re-checks those gates, verifies its own
-  identity through IMDS, and deallocates itself. Deallocate, not shutdown,
-  is what stops compute billing. Run it with `-WhatIf` on a host to test the
-  identity and role without deallocating. Setup is step 6 of the deployment
-  guide.
+  is the remediation script. It re-checks those gates and verifies its own
+  identity through IMDS. It then schedules its own deallocation 10 minutes
+  later, so Intune receives the result before the VM stops. When the
+  scheduled run fires, it checks for sessions again before it deallocates.
+  It records the outcome, and the next detection run reports it to the
+  Intune console. Deallocate, not shutdown, is what stops compute billing.
+  Run it with `-WhatIf` on a host to test the identity and role without
+  changing anything. Setup is step 6 of the deployment guide.
 
 ## Folder map
 

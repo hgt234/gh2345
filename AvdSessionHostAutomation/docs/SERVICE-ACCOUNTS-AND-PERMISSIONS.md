@@ -406,10 +406,12 @@ prior organization. This is implemented in the repository:
   running applications are lost - or the VM has not been up past the idle
   threshold, it reports nothing to do. Otherwise the remediation script,
   [endpoint/Invoke-AvdSelfDeallocate.ps1](../endpoint/Invoke-AvdSelfDeallocate.ps1),
-  re-checks those gates, reads its own compute metadata and a management
-  token from IMDS (link-local, no stored credential), verifies the metadata
-  names this machine, and calls deallocate on itself. Deallocate, not guest
-  shutdown, is what releases compute billing.
+  re-checks those gates. It reads its own compute metadata and a management
+  token from IMDS (link-local, no stored credential) and verifies the
+  metadata names this machine. It then schedules a one-time SYSTEM task
+  that, 10 minutes later, re-checks for sessions and calls deallocate on
+  itself. The delay lets Intune record the result before the VM stops.
+  Deallocate, not guest shutdown, is what releases compute billing.
 
 **What we are asking for (summary):** nothing beyond what the pipeline
 request already contains - the role definition arrives with the one-time

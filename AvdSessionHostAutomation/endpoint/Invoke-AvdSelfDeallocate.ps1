@@ -6,25 +6,35 @@
     sessions and has been running past an idle threshold.
 
 .DESCRIPTION
-    Runs on the session host itself, on a schedule, as SYSTEM. Usage-aware by
-    design: it acts on the actual session state of the machine, not on a time
-    window, so it suits 24/7 personal workloads.
+    Runs on the session host itself as SYSTEM. Usage-aware by design: it acts
+    on the actual session state of the machine, not on a time window, so it
+    suits 24/7 personal workloads.
 
-    Order of checks, cheapest first:
+    It runs in two steps, so Intune receives its result before the VM goes
+    down:
 
-    1. Sessions: any session reported by quser, active or disconnected,
-       means the desktop is in use and the script exits without touching
-       anything. Disconnected sessions are preserved on purpose; closing
-       them would lose the user's running applications.
-    2. Uptime: the machine must have been up at least MinimumUptimeMinutes,
-       so a host that Start VM on Connect just powered on is not fought over.
-    3. Identity loopback: the VM's compute metadata and a management-plane
-       token are read from IMDS (169.254.169.254, link-local, no credential
-       stored anywhere). The metadata name must match this computer's name;
-       on mismatch the script refuses to act.
-    4. Deallocate: a single POST to this VM's own deallocate action. The
-       system-assigned identity holds the AVD Prod Self Deallocate role
-       scoped to this VM only, so the blast radius is this machine.
+    1. Schedule (default; run by Intune Remediations). Checks the gates
+       below, proves the managed identity can read this VM, then registers a
+       one-time SYSTEM scheduled task that runs this script again with
+       -Deferred after DeallocateDelayMinutes, and exits. Intune then runs
+       the detection script again and uploads the result while the VM is
+       still up.
+    2. Deferred (run by the scheduled task). Checks every gate again, so a
+       user who connected during the delay is never cut off, then calls
+       deallocate on this VM.
+
+    Gates, cheapest first:
+
+    - Sessions: any session reported by quser, active or disconnected, means
+      the desktop is in use and nothing happens. Disconnected sessions are
+      preserved on purpose; closing them would lose the user's running
+      applications.
+    - Uptime: the machine must have been up at least MinimumUptimeMinutes,
+      so a host that Start VM on Connect just powered on is not fought over.
+    - Identity loopback: the VM's compute metadata and a management-plane
+      token are read from IMDS (169.254.169.254, link-local, no credential
+      stored anywhere). The metadata name must match this computer's name;
+      on mismatch the script refuses to act.
 
     Deallocate, not a guest shutdown: only deallocation releases the compute
     hardware and stops billing. The call returns accepted and Azure then
@@ -32,14 +42,24 @@
 
     Deploy with Intune Remediations as the remediation script, paired with
     Detect-AvdSelfDeallocate.ps1 as the detection script, on an hourly
-    schedule, as SYSTEM, in 64-bit PowerShell. Intune runs this script only
-    when detection reports the host idle, and this script re-checks every
-    gate itself, so a user who connects in between is never cut off. After
-    Azure accepts the deallocation, the script records the time under
-    HKLM:\SOFTWARE\AvdSessionHostAutomation\SelfDeallocate so the detection
-    run that follows reports the host as handled while it shuts down. A
-    second deallocation request while one is in flight is a no-op from
-    Azure's point of view.
+    schedule, as SYSTEM, in 64-bit PowerShell.
+
+    State, under HKLM:\SOFTWARE\AvdSessionHostAutomation\SelfDeallocate:
+    - DeallocateScheduledUtc: when the schedule step registered the task.
+      The detection script reports the host as handled while this is recent,
+      so Intune records the issue as fixed.
+    - LastResult: a timestamped line from the latest schedule or deferred
+      run (scheduled, deallocation accepted, cancelled, or failed). The
+      detection script repeats it in its output, so the outcome of the
+      deferred run shows in the Intune console on the next detection.
+
+    For the deferred run, the script copies itself to
+    C:\Program Files\AvdSessionHostAutomation, which standard users cannot
+    write, so the SYSTEM task never runs a file a user could change. The
+    task is registered as \AvdSessionHostAutomation\AvdSelfDeallocate and
+    is replaced on each schedule run. Its trigger is one-time and does not
+    start late, so a VM that was off at the due time does not deallocate on
+    its next boot.
 
     -WhatIf is the identity test. It runs every read-only step even when a
     session is open or the uptime threshold is not met (so it can be run
@@ -47,12 +67,24 @@
     verdict, requests the managed-identity token from IMDS, and reads this
     VM through Azure Resource Manager with that token. A pass proves the
     system-assigned identity is enabled and holds the self-deallocate role
-    on this VM. It never calls deallocate.
+    on this VM. It copies nothing, registers no task, writes no state, and
+    never calls deallocate.
 
 .PARAMETER MinimumUptimeMinutes
     Minimum minutes since boot before the host may deallocate itself. Intune
     Remediations pass no parameters, so the default is the configuration;
-    keep it equal to the default in Detect-AvdSelfDeallocate.ps1.
+    keep it equal to the default in Detect-AvdSelfDeallocate.ps1. The
+    schedule step passes its value to the deferred run.
+
+.PARAMETER DeallocateDelayMinutes
+    Minutes between the schedule step and the deferred deallocation. It
+    gives Intune time to upload the remediation result. Must stay below
+    MarkerValidMinutes in Detect-AvdSelfDeallocate.ps1 (the Pester suite
+    checks the defaults).
+
+.PARAMETER Deferred
+    Runs the deferred step: re-check the gates and deallocate. Used by the
+    scheduled task; not set in Intune.
 
 .PARAMETER ManagementEndpoint
     Azure Resource Manager endpoint; the default is the public cloud.
@@ -61,24 +93,32 @@
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-AvdSelfDeallocate.ps1 -WhatIf
 
     Tests the managed identity and role from an elevated prompt on the host,
-    without deallocating. Run the whole file; running a selection skips the
-    param block and its defaults.
+    without scheduling or deallocating. Run the whole file; running a
+    selection skips the param block and its defaults.
 
 .EXAMPLE
-    .\Invoke-AvdSelfDeallocate.ps1 -MinimumUptimeMinutes 60
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Invoke-AvdSelfDeallocate.ps1 -Deferred -WhatIf
+
+    Shows what the deferred run would do now, without deallocating.
 
 .NOTES
     Requires the VM's system-assigned managed identity to hold
     Microsoft.Compute/virtualMachines/read and
     Microsoft.Compute/virtualMachines/deallocate/action on this VM (granted
     by the build pipeline's Assign stage). IMDS calls must not go through a
-    proxy; SYSTEM normally has none configured.
+    proxy; SYSTEM normally has none configured. The scheduled task runs
+    powershell.exe with -ExecutionPolicy Bypass; an execution policy set by
+    Group Policy overrides that and would block the deferred run.
     https://learn.microsoft.com/azure/virtual-machines/instance-metadata-service
     https://learn.microsoft.com/azure/active-directory/managed-identities-azure-resources/how-to-use-vm-token
+    https://learn.microsoft.com/powershell/module/scheduledtasks/register-scheduledtask
+    https://learn.microsoft.com/powershell/module/scheduledtasks/new-scheduledtasksettingsset
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
     [ValidateRange(5, 1440)][int]$MinimumUptimeMinutes = 60,
+    [ValidateRange(1, 20)][int]$DeallocateDelayMinutes = 10,
+    [switch]$Deferred,
     [ValidatePattern('\Ahttps://[a-z0-9.-]+\z')][string]$ManagementEndpoint = 'https://management.azure.com'
 )
 
@@ -86,7 +126,12 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
 $markerKey = 'HKLM:\SOFTWARE\AvdSessionHostAutomation\SelfDeallocate'
-$markerValueName = 'DeallocateRequestedUtc'
+$markerValueName = 'DeallocateScheduledUtc'
+$resultValueName = 'LastResult'
+$taskName = 'AvdSelfDeallocate'
+$taskPath = '\AvdSessionHostAutomation\'
+$installDirectory = '{0}\AvdSessionHostAutomation' -f $env:ProgramFiles
+$installedScript = '{0}\Invoke-AvdSelfDeallocate.ps1' -f $installDirectory
 
 function Get-ActiveSessionCount {
     [CmdletBinding()]
@@ -143,73 +188,162 @@ function Get-ImdsAccessToken {
     return [string]$response.access_token
 }
 
+function Write-SelfDeallocateState {
+    # Callers invoke this only after their ShouldProcess decision. A failed
+    # write is a warning, not an error: the state is for reporting and must
+    # never turn a successful run into a failed one.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Value
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $Key)) {
+            New-Item -Path $Key -Force | Out-Null
+        }
+        Set-ItemProperty -LiteralPath $Key -Name $Name -Value $Value
+    }
+    catch {
+        Write-Warning "Could not record $Name under $Key for the detection script: $($_.Exception.Message)"
+    }
+}
+
+function Write-SelfDeallocateResult {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Message
+    )
+
+    # Kept short: the detection script repeats this line, and Intune keeps
+    # only the first 2,048 characters of script output.
+    if ($Message.Length -gt 400) { $Message = $Message.Substring(0, 400) }
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+    Write-SelfDeallocateState -Key $Key -Name $Name -Value "$stamp $Message"
+}
+
 $isWhatIf = [bool]$WhatIfPreference
+$recordsResult = $Deferred -and -not $isWhatIf
 
-$sessionCount = Get-ActiveSessionCount
-$uptimeMinutes = [Math]::Floor((Get-HostUptime))
-$blockReason = $null
-if ($sessionCount -gt 0) {
-    $blockReason = "In use: $sessionCount session(s) present."
-}
-elseif ($uptimeMinutes -lt $MinimumUptimeMinutes) {
-    $blockReason = "Up $uptimeMinutes of $MinimumUptimeMinutes minimum minutes."
-}
-if ($blockReason -and -not $isWhatIf) {
-    Write-Output "$blockReason No action."
-    return
-}
-
-$metadata = Get-ImdsComputeInstance
-$vmName = [string]$metadata.name
-$localName = [Environment]::MachineName
-if ($vmName -ine $localName) {
-    throw "IMDS reports VM '$vmName' but this computer is '$localName'. Refusing to deallocate."
-}
-
-$vmUri = '{0}/subscriptions/{1}/resourceGroups/{2}/providers/Microsoft.Compute/virtualMachines/{3}' -f `
-    $ManagementEndpoint, [string]$metadata.subscriptionId, [string]$metadata.resourceGroupName, $vmName
-$apiVersion = 'api-version=2024-03-01'
-
-$token = Get-ImdsAccessToken -Resource "$ManagementEndpoint/"
 try {
-    if ($isWhatIf) {
-        try {
-            Invoke-RestMethod -Method Get -TimeoutSec 30 `
+    $sessionCount = Get-ActiveSessionCount
+    $uptimeMinutes = [Math]::Floor((Get-HostUptime))
+    $blockReason = $null
+    if ($sessionCount -gt 0) {
+        $blockReason = "In use: $sessionCount session(s) present."
+    }
+    elseif ($uptimeMinutes -lt $MinimumUptimeMinutes) {
+        $blockReason = "Up $uptimeMinutes of $MinimumUptimeMinutes minimum minutes."
+    }
+    if ($blockReason -and -not $isWhatIf) {
+        if ($recordsResult) {
+            Write-SelfDeallocateResult -Key $markerKey -Name $resultValueName -Message "Deallocation cancelled. $blockReason"
+        }
+        Write-Output "$blockReason No action."
+        return
+    }
+
+    $metadata = Get-ImdsComputeInstance
+    $vmName = [string]$metadata.name
+    $localName = [Environment]::MachineName
+    if ($vmName -ine $localName) {
+        throw "IMDS reports VM '$vmName' but this computer is '$localName'. Refusing to deallocate."
+    }
+
+    $vmUri = '{0}/subscriptions/{1}/resourceGroups/{2}/providers/Microsoft.Compute/virtualMachines/{3}' -f `
+        $ManagementEndpoint, [string]$metadata.subscriptionId, [string]$metadata.resourceGroupName, $vmName
+    $apiVersion = 'api-version=2024-03-01'
+    $idleSummary = "0 sessions, up $uptimeMinutes minutes"
+
+    $token = Get-ImdsAccessToken -Resource "$ManagementEndpoint/"
+    try {
+        # The schedule step and -WhatIf prove the identity can read this VM,
+        # so a missing role fails the Intune remediation visibly instead of
+        # failing later inside the scheduled task.
+        if ($isWhatIf -or -not $Deferred) {
+            try {
+                Invoke-RestMethod -Method Get -TimeoutSec 30 `
+                    -Headers @{ Authorization = "Bearer $token" } `
+                    -Uri ('{0}?{1}' -f $vmUri, $apiVersion) | Out-Null
+            }
+            catch {
+                throw "A token was issued, but Azure Resource Manager refused to read VM '$vmName'. Check that the VM's identity holds the AVD Prod Self Deallocate role on this VM. $($_.Exception.Message)"
+            }
+            if ($isWhatIf) {
+                Write-Output "Identity check passed: the managed-identity token for $ManagementEndpoint/ can read VM '$vmName'."
+            }
+        }
+
+        if ($blockReason) {
+            Write-Output "$blockReason Would take no action. Nothing was changed."
+            return
+        }
+
+        if ($Deferred) {
+            if (-not $PSCmdlet.ShouldProcess($vmName, "Deallocate idle session host ($idleSummary)")) {
+                Write-Output "Would deallocate '$vmName'. Nothing was changed."
+                return
+            }
+            Invoke-RestMethod -Method Post -TimeoutSec 60 `
                 -Headers @{ Authorization = "Bearer $token" } `
-                -Uri ('{0}?{1}' -f $vmUri, $apiVersion) | Out-Null
+                -Uri ('{0}/deallocate?{1}' -f $vmUri, $apiVersion) | Out-Null
         }
-        catch {
-            throw "A token was issued, but Azure Resource Manager refused to read VM '$vmName'. Check that the VM's identity holds the AVD Prod Self Deallocate role on this VM. $($_.Exception.Message)"
-        }
-        Write-Output "Identity check passed: the managed-identity token for $ManagementEndpoint/ can read VM '$vmName'."
+    }
+    finally {
+        $token = $null
     }
 
-    if ($blockReason) {
-        Write-Output "$blockReason Would take no action. Nothing was changed."
+    if ($Deferred) {
+        $message = "Deallocation of '$vmName' accepted ($idleSummary)."
+        Write-SelfDeallocateResult -Key $markerKey -Name $resultValueName -Message $message
+        Write-Output $message
         return
     }
 
-    if (-not $PSCmdlet.ShouldProcess($vmName, "Deallocate idle session host (0 sessions, up $uptimeMinutes minutes)")) {
-        Write-Output "Would deallocate '$vmName'. Nothing was changed."
+    $dueLocal = (Get-Date).AddMinutes($DeallocateDelayMinutes)
+    $dueText = $dueLocal.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+    $action = "Schedule deallocation of idle session host in $DeallocateDelayMinutes minute(s) ($idleSummary)"
+    if (-not $PSCmdlet.ShouldProcess($vmName, $action)) {
+        Write-Output "Would schedule deallocation of '$vmName' for $dueText (in $DeallocateDelayMinutes minute(s)). Nothing was changed."
         return
     }
 
-    Invoke-RestMethod -Method Post -TimeoutSec 60 `
-        -Headers @{ Authorization = "Bearer $token" } `
-        -Uri ('{0}/deallocate?{1}' -f $vmUri, $apiVersion) | Out-Null
-}
-finally {
-    $token = $null
-}
-
-try {
-    if (-not (Test-Path -LiteralPath $markerKey)) {
-        New-Item -Path $markerKey -Force | Out-Null
+    if (-not $PSCommandPath) {
+        throw 'Cannot locate this script file to install it for the deferred run. Run it with -File.'
     }
-    Set-ItemProperty -LiteralPath $markerKey -Name $markerValueName `
+    if (-not (Test-Path -LiteralPath $installDirectory)) {
+        New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
+    }
+    if ($PSCommandPath -ine $installedScript) {
+        Copy-Item -LiteralPath $PSCommandPath -Destination $installedScript -Force
+    }
+
+    $powershellPath = '{0}\System32\WindowsPowerShell\v1.0\powershell.exe' -f $env:SystemRoot
+    $taskArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Deferred -MinimumUptimeMinutes {1} -ManagementEndpoint {2}' -f `
+        $installedScript, $MinimumUptimeMinutes, $ManagementEndpoint
+    $taskAction = New-ScheduledTaskAction -Execute $powershellPath -Argument $taskArguments
+    $taskTrigger = New-ScheduledTaskTrigger -Once -At $dueLocal
+    $taskPrincipal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    # StartWhenAvailable is deliberately not set: a run missed while the VM
+    # was off must not fire at the next boot.
+    $taskSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 15) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $taskName -TaskPath $taskPath -Action $taskAction -Trigger $taskTrigger `
+        -Principal $taskPrincipal -Settings $taskSettings -Force `
+        -Description 'Deallocates this AVD session host if it is still idle. Registered by Invoke-AvdSelfDeallocate.ps1 (Intune Remediations).' |
+        Out-Null
+
+    Write-SelfDeallocateState -Key $markerKey -Name $markerValueName `
         -Value ((Get-Date).ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture))
+    $message = "Identity check passed. Deallocation of '$vmName' scheduled for $dueText ($idleSummary); it is cancelled if a user connects first."
+    Write-SelfDeallocateResult -Key $markerKey -Name $resultValueName -Message $message
+    Write-Output $message
 }
 catch {
-    Write-Warning "Deallocation was accepted, but the marker for the detection script could not be written: $($_.Exception.Message)"
+    if ($recordsResult) {
+        Write-SelfDeallocateResult -Key $markerKey -Name $resultValueName -Message "Deallocation failed. $($_.Exception.Message)"
+    }
+    throw
 }
-Write-Output "Deallocation of '$vmName' was accepted after $uptimeMinutes idle minutes with no sessions."

@@ -700,17 +700,60 @@ Describe 'Infrastructure safety' {
 Describe 'Invoke-AvdSelfDeallocate' {
     BeforeAll {
         $script:selfDeallocate = Join-Path $script:repoRoot 'endpoint/Invoke-AvdSelfDeallocate.ps1'
-        # Stand-ins so quser.exe and the Windows-only Get-CimInstance can be
-        # mocked on any platform.
+        $script:savedProgramFiles = $env:ProgramFiles
+        $script:savedSystemRoot = $env:SystemRoot
+        $env:ProgramFiles = 'C:\Program Files'
+        $env:SystemRoot = 'C:\Windows'
+        $script:installedScript = 'C:\Program Files\AvdSessionHostAutomation\Invoke-AvdSelfDeallocate.ps1'
+
+        # Stand-ins so quser.exe, the Windows-only Get-CimInstance, and the
+        # ScheduledTasks module can be mocked on any platform. Their
+        # parameters exist only so Pester's mocks accept the script's
+        # named arguments.
         function quser { }
         function Get-CimInstance {
-            # Get-CimInstance only exists on Windows; this stub lets the
-            # offline tests mock it, and ClassName exists only so Pester's
-            # mock accepts the script's -ClassName argument.
             [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '', Justification = 'Offline stand-in for a Windows-only cmdlet; the mock replaces it.')]
-            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'ClassName', Justification = 'Declared so the mocked call binds -ClassName.')]
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Declared so the mocked call binds its arguments.')]
             param($ClassName)
         }
+        function New-ScheduledTaskAction {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Stand-in for a cmdlet that only builds an in-memory object.')]
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Declared so the mocked call binds its arguments.')]
+            param($Execute, $Argument)
+        }
+        function New-ScheduledTaskTrigger {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Stand-in for a cmdlet that only builds an in-memory object.')]
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Declared so the mocked call binds its arguments.')]
+            param([switch]$Once, $At)
+        }
+        function New-ScheduledTaskPrincipal {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Stand-in for a cmdlet that only builds an in-memory object.')]
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Declared so the mocked call binds its arguments.')]
+            param($UserId, $LogonType, $RunLevel)
+        }
+        function New-ScheduledTaskSettingsSet {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Stand-in for a cmdlet that only builds an in-memory object.')]
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Declared so the mocked call binds its arguments.')]
+            param($ExecutionTimeLimit, $MultipleInstances, [switch]$StartWhenAvailable)
+        }
+        function Register-ScheduledTask {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Declared so the mocked call binds its arguments.')]
+            param($TaskName, $TaskPath, $Action, $Trigger, $Principal, $Settings, [switch]$Force, $Description)
+        }
+
+        $script:sessionOpen = { $global:LASTEXITCODE = 0; @(' USERNAME  SESSIONNAME  ID  STATE', '>user1  rdp-tcp#1  2  Active') }
+        $script:noMutation = {
+            Should -Invoke Register-ScheduledTask -Times 0 -Exactly
+            Should -Invoke Copy-Item -Times 0 -Exactly
+            Should -Invoke Set-ItemProperty -Times 0 -Exactly
+            Should -Invoke New-Item -Times 0 -Exactly
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Method -eq 'Post' }
+        }
+    }
+
+    AfterAll {
+        $env:ProgramFiles = $script:savedProgramFiles
+        $env:SystemRoot = $script:savedSystemRoot
     }
 
     BeforeEach {
@@ -726,124 +769,222 @@ Describe 'Invoke-AvdSelfDeallocate' {
             $Method -eq 'Get' -and $Uri -like 'https://management.azure.com/*'
         }
         Mock Invoke-RestMethod { $null } -ParameterFilter { $Method -eq 'Post' }
-        Mock Test-Path { $false } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
-        Mock New-Item { } -ParameterFilter { $Path -like 'HKLM:*' }
+        Mock Test-Path { $false } -ParameterFilter { $LiteralPath -like 'HKLM:*' -or $LiteralPath -like 'C:\Program Files*' }
+        Mock New-Item { } -ParameterFilter { $Path -like 'HKLM:*' -or $Path -like 'C:\Program Files*' }
         Mock Set-ItemProperty { } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
+        Mock Copy-Item { } -ParameterFilter { $Destination -like 'C:\Program Files*' }
+        Mock New-ScheduledTaskAction { 'task-action' }
+        Mock New-ScheduledTaskTrigger { 'task-trigger' }
+        Mock New-ScheduledTaskPrincipal { 'task-principal' }
+        Mock New-ScheduledTaskSettingsSet { 'task-settings' }
+        Mock Register-ScheduledTask { }
     }
 
-    It 'with -WhatIf writes no marker' {
-        & $script:selfDeallocate -WhatIf *>&1 | Out-Null
-        Should -Invoke Set-ItemProperty -Times 0 -Exactly
-        Should -Invoke New-Item -Times 0 -Exactly
-    }
+    Context 'Schedule step (Intune remediation)' {
+        It 'registers a one-time SYSTEM task that runs the installed copy with -Deferred' {
+            & $script:selfDeallocate *>&1 | Out-Null
+            Should -Invoke Register-ScheduledTask -Times 1 -Exactly -ParameterFilter {
+                $TaskName -eq 'AvdSelfDeallocate' -and $TaskPath -eq '\AvdSessionHostAutomation\' -and $Force -and
+                $Action -eq 'task-action' -and $Trigger -eq 'task-trigger' -and
+                $Principal -eq 'task-principal' -and $Settings -eq 'task-settings'
+            }
+            Should -Invoke New-ScheduledTaskPrincipal -Times 1 -Exactly -ParameterFilter {
+                $UserId -eq 'NT AUTHORITY\SYSTEM' -and $LogonType -eq 'ServiceAccount' -and $RunLevel -eq 'Highest'
+            }
+            Should -Invoke New-ScheduledTaskAction -Times 1 -Exactly -ParameterFilter {
+                $Execute -eq 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -and
+                $Argument -eq ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Deferred -MinimumUptimeMinutes 60 -ManagementEndpoint https://management.azure.com' -f $script:installedScript)
+            }
+        }
 
-    It 'records the accepted deallocation for the detection script' {
-        & $script:selfDeallocate *>&1 | Out-Null
-        Should -Invoke Set-ItemProperty -Times 1 -Exactly -ParameterFilter {
-            $LiteralPath -eq 'HKLM:\SOFTWARE\AvdSessionHostAutomation\SelfDeallocate' -and
-            $Name -eq 'DeallocateRequestedUtc' -and
-            [datetime]::Parse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) -gt (Get-Date).ToUniversalTime().AddMinutes(-1)
+        It 'schedules the deallocation DeallocateDelayMinutes out' {
+            $before = Get-Date
+            & $script:selfDeallocate -DeallocateDelayMinutes 7 *>&1 | Out-Null
+            Should -Invoke New-ScheduledTaskTrigger -Times 1 -Exactly -ParameterFilter {
+                $Once -and $At -ge $before.AddMinutes(7) -and $At -le (Get-Date).AddMinutes(7)
+            }
+        }
+
+        It 'never lets a missed trigger start late and bounds the run time' {
+            & $script:selfDeallocate *>&1 | Out-Null
+            Should -Invoke New-ScheduledTaskSettingsSet -Times 1 -Exactly -ParameterFilter {
+                -not $StartWhenAvailable -and $ExecutionTimeLimit -eq (New-TimeSpan -Minutes 15) -and $MultipleInstances -eq 'IgnoreNew'
+            }
+        }
+
+        It 'installs itself under Program Files for the task' {
+            & $script:selfDeallocate *>&1 | Out-Null
+            Should -Invoke New-Item -Times 1 -Exactly -ParameterFilter {
+                $Path -eq 'C:\Program Files\AvdSessionHostAutomation' -and $ItemType -eq 'Directory'
+            }
+            Should -Invoke Copy-Item -Times 1 -Exactly -ParameterFilter {
+                $LiteralPath -eq $script:selfDeallocate -and $Destination -eq $script:installedScript -and $Force
+            }
+        }
+
+        It 'proves the identity can read the VM and does not deallocate' {
+            $output = & $script:selfDeallocate *>&1 | Out-String
+            $output | Should -BeLike "*Identity check passed. Deallocation of '$([Environment]::MachineName)' scheduled for *"
+            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
+                $Method -eq 'Get' -and $Uri -like 'https://management.azure.com/*' -and $Headers.Authorization -eq 'Bearer fixture-token'
+            }
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Method -eq 'Post' }
+        }
+
+        It 'records the schedule marker and result for the detection script' {
+            & $script:selfDeallocate *>&1 | Out-Null
+            Should -Invoke Set-ItemProperty -Times 1 -Exactly -ParameterFilter {
+                $LiteralPath -eq 'HKLM:\SOFTWARE\AvdSessionHostAutomation\SelfDeallocate' -and
+                $Name -eq 'DeallocateScheduledUtc' -and
+                [datetime]::Parse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) -gt (Get-Date).ToUniversalTime().AddMinutes(-1)
+            }
+            Should -Invoke Set-ItemProperty -Times 1 -Exactly -ParameterFilter {
+                $Name -eq 'LastResult' -and $Value -match '\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ Identity check passed\. Deallocation of .+ scheduled for '
+            }
+        }
+
+        It 'fails before scheduling when ARM refuses the read' {
+            Mock Invoke-RestMethod { throw 'Response status code does not indicate success: 403 (Forbidden).' } -ParameterFilter {
+                $Method -eq 'Get' -and $Uri -like 'https://management.azure.com/*'
+            }
+            { & $script:selfDeallocate *>&1 | Out-Null } | Should -Throw '*AVD Prod Self Deallocate role*'
+            & $script:noMutation
+        }
+
+        It 'still reports success when the state cannot be written' {
+            Mock Set-ItemProperty { throw 'Access denied' } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
+            $output = & $script:selfDeallocate *>&1 | Out-String
+            $output | Should -BeLike '*Could not record DeallocateScheduledUtc*'
+            $output | Should -BeLike '*scheduled for*'
+        }
+
+        It 'does nothing while any session exists' {
+            Mock quser $script:sessionOpen
+            $output = & $script:selfDeallocate *>&1 | Out-String
+            $output | Should -BeLike '*In use*No action*'
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly
+            & $script:noMutation
+        }
+
+        It 'treats a disconnected session as in use' {
+            Mock quser { $global:LASTEXITCODE = 0; @(' USERNAME  SESSIONNAME  ID  STATE', ' user1  4  Disc') }
+            $output = & $script:selfDeallocate *>&1 | Out-String
+            $output | Should -BeLike '*In use*'
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly
+        }
+
+        It 'does nothing before the uptime threshold' {
+            Mock Get-CimInstance { [pscustomobject]@{ LastBootUpTime = (Get-Date).AddMinutes(-10) } }
+            $output = & $script:selfDeallocate *>&1 | Out-String
+            $output | Should -BeLike '*minimum minutes*'
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly
+            & $script:noMutation
+        }
+
+        It 'refuses to act when IMDS names a different VM' {
+            Mock Invoke-RestMethod {
+                [pscustomobject]@{ name = 'SOMEOTHERVM'; subscriptionId = 'sub-1'; resourceGroupName = 'rg-hosts' }
+            } -ParameterFilter { $Uri -match 'metadata/instance/compute' }
+            { & $script:selfDeallocate *>&1 | Out-Null } | Should -Throw '*Refusing to deallocate*'
+            & $script:noMutation
         }
     }
 
-    It 'still reports success when the marker cannot be written' {
-        Mock Set-ItemProperty { throw 'Access denied' } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
-        $output = & $script:selfDeallocate *>&1 | Out-String
-        $output | Should -BeLike '*marker for the detection script could not be written*'
-        $output | Should -BeLike '*was accepted*'
-    }
-
-    It 'writes no marker when a session blocks the run' {
-        Mock quser { $global:LASTEXITCODE = 0; @(' USERNAME  SESSIONNAME  ID  STATE', '>user1  rdp-tcp#1  2  Active') }
-        & $script:selfDeallocate *>&1 | Out-Null
-        Should -Invoke Set-ItemProperty -Times 0 -Exactly
-    }
-
-    It 'with -WhatIf tests the token against ARM and changes nothing' {
-        $output = & $script:selfDeallocate -WhatIf *>&1 | Out-String
-        $output | Should -BeLike '*Identity check passed*'
-        $output | Should -BeLike '*Would deallocate*'
-        Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
-            $Uri -match 'oauth2/token' -and $Uri -like '*resource=https%3A%2F%2Fmanagement.azure.com%2F'
+    Context 'Deferred step (scheduled task)' {
+        It 'deallocates itself when still idle, treating a quser failure as zero sessions' {
+            $output = & $script:selfDeallocate -Deferred *>&1 | Out-String
+            $output | Should -BeLike '*accepted*'
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter {
+                $Method -eq 'Get' -and $Uri -like 'https://management.azure.com/*'
+            }
+            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
+                $Method -eq 'Post' -and
+                $Uri -like "https://management.azure.com/subscriptions/sub-1/resourceGroups/rg-hosts/providers/Microsoft.Compute/virtualMachines/$([Environment]::MachineName)/deallocate?api-version=*" -and
+                $Headers.Authorization -eq 'Bearer fixture-token'
+            }
+            Should -Invoke Register-ScheduledTask -Times 0 -Exactly
+            Should -Invoke Copy-Item -Times 0 -Exactly
         }
-        Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
-            $Method -eq 'Get' -and
-            $Uri -like "https://management.azure.com/subscriptions/sub-1/resourceGroups/rg-hosts/providers/Microsoft.Compute/virtualMachines/$([Environment]::MachineName)?api-version=*" -and
-            $Headers.Authorization -eq 'Bearer fixture-token'
+
+        It 'records the accepted deallocation as the last result' {
+            & $script:selfDeallocate -Deferred *>&1 | Out-Null
+            Should -Invoke Set-ItemProperty -Times 1 -Exactly -ParameterFilter {
+                $Name -eq 'LastResult' -and $Value -like '*Deallocation of * accepted (0 sessions, up * minutes).'
+            }
+            Should -Invoke Set-ItemProperty -Times 0 -Exactly -ParameterFilter { $Name -eq 'DeallocateScheduledUtc' }
         }
-        Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Method -eq 'Post' }
-    }
 
-    It 'with -WhatIf still tests the identity while a session is open' {
-        Mock quser { $global:LASTEXITCODE = 0; @(' USERNAME  SESSIONNAME  ID  STATE', '>tech1  rdp-tcp#1  2  Active') }
-        $output = & $script:selfDeallocate -WhatIf *>&1 | Out-String
-        $output | Should -BeLike '*Identity check passed*'
-        $output | Should -BeLike '*In use: 1 session(s) present. Would take no action*'
-        Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Method -eq 'Post' }
-    }
-
-    It 'with -WhatIf reports a missing role when ARM refuses the read' {
-        Mock Invoke-RestMethod { throw 'Response status code does not indicate success: 403 (Forbidden).' } -ParameterFilter {
-            $Method -eq 'Get' -and $Uri -like 'https://management.azure.com/*'
+        It 'cancels and records why when a user connected during the delay' {
+            Mock quser $script:sessionOpen
+            $output = & $script:selfDeallocate -Deferred *>&1 | Out-String
+            $output | Should -BeLike '*In use*No action*'
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly
+            Should -Invoke Set-ItemProperty -Times 1 -Exactly -ParameterFilter {
+                $Name -eq 'LastResult' -and $Value -like '*Deallocation cancelled. In use: 1 session(s) present.'
+            }
         }
-        { & $script:selfDeallocate -WhatIf *>&1 | Out-Null } | Should -Throw '*AVD Prod Self Deallocate role*'
-        Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Method -eq 'Post' }
-    }
 
-    It 'names the requested resource when IMDS refuses the token' {
-        Mock Invoke-RestMethod { throw 'Response status code does not indicate success: 400 (Bad Request).' } -ParameterFilter {
-            $Uri -match 'metadata/identity/oauth2/token'
+        It 'records the failure when Azure refuses the deallocation' {
+            Mock Invoke-RestMethod { throw 'Response status code does not indicate success: 403 (Forbidden).' } -ParameterFilter { $Method -eq 'Post' }
+            { & $script:selfDeallocate -Deferred *>&1 | Out-Null } | Should -Throw '*403*'
+            Should -Invoke Set-ItemProperty -Times 1 -Exactly -ParameterFilter {
+                $Name -eq 'LastResult' -and $Value -like '*Deallocation failed. *403*'
+            }
         }
-        { & $script:selfDeallocate -WhatIf *>&1 | Out-Null } | Should -Throw "*resource 'https://management.azure.com/'*"
-    }
 
-    It 'does nothing while any session exists' {
-        Mock quser { $global:LASTEXITCODE = 0; @(' USERNAME  SESSIONNAME  ID  STATE', '>user1  rdp-tcp#1  2  Active') }
-        $output = & $script:selfDeallocate *>&1 | Out-String
-        $output | Should -BeLike '*In use*'
-        Should -Invoke Invoke-RestMethod -Times 0 -Exactly
-    }
-
-    It 'treats a disconnected session as in use' {
-        Mock quser { $global:LASTEXITCODE = 0; @(' USERNAME  SESSIONNAME  ID  STATE', ' user1  4  Disc') }
-        $output = & $script:selfDeallocate *>&1 | Out-String
-        $output | Should -BeLike '*In use*'
-        Should -Invoke Invoke-RestMethod -Times 0 -Exactly
-    }
-
-    It 'does nothing before the uptime threshold' {
-        Mock Get-CimInstance { [pscustomobject]@{ LastBootUpTime = (Get-Date).AddMinutes(-10) } }
-        $output = & $script:selfDeallocate *>&1 | Out-String
-        $output | Should -BeLike '*minimum minutes*'
-        Should -Invoke Invoke-RestMethod -Times 0 -Exactly
-    }
-
-    It 'refuses to act when IMDS names a different VM' {
-        Mock Invoke-RestMethod {
-            [pscustomobject]@{ name = 'SOMEOTHERVM'; subscriptionId = 'sub-1'; resourceGroupName = 'rg-hosts' }
-        } -ParameterFilter { $Uri -match 'metadata/instance/compute' }
-        { & $script:selfDeallocate *>&1 | Out-Null } | Should -Throw '*Refusing to deallocate*'
-        Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Method -eq 'Post' }
-    }
-
-    It 'deallocates itself when idle, treating a quser failure as zero sessions' {
-        $output = & $script:selfDeallocate *>&1 | Out-String
-        $output | Should -BeLike '*was accepted*'
-        Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter {
-            $Method -eq 'Get' -and $Uri -like 'https://management.azure.com/*'
-        }
-        Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
-            $Method -eq 'Post' -and
-            $Uri -like "https://management.azure.com/subscriptions/sub-1/resourceGroups/rg-hosts/providers/Microsoft.Compute/virtualMachines/$([Environment]::MachineName)/deallocate?api-version=*" -and
-            $Headers.Authorization -eq 'Bearer fixture-token'
+        It 'with -WhatIf tests the identity and changes nothing' {
+            $output = & $script:selfDeallocate -Deferred -WhatIf *>&1 | Out-String
+            $output | Should -BeLike '*Identity check passed*'
+            $output | Should -BeLike '*Would deallocate*'
+            & $script:noMutation
         }
     }
 
-    It 'never writes the token to output' {
-        $output = & $script:selfDeallocate *>&1 | Out-String
-        $output | Should -Not -BeLike '*fixture-token*'
-        $output = & $script:selfDeallocate -WhatIf *>&1 | Out-String
-        $output | Should -Not -BeLike '*fixture-token*'
+    Context 'WhatIf identity test' {
+        It 'with -WhatIf tests the token against ARM and changes nothing' {
+            $output = & $script:selfDeallocate -WhatIf *>&1 | Out-String
+            $output | Should -BeLike '*Identity check passed*'
+            $output | Should -BeLike '*Would schedule deallocation*'
+            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
+                $Uri -match 'oauth2/token' -and $Uri -like '*resource=https%3A%2F%2Fmanagement.azure.com%2F'
+            }
+            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
+                $Method -eq 'Get' -and
+                $Uri -like "https://management.azure.com/subscriptions/sub-1/resourceGroups/rg-hosts/providers/Microsoft.Compute/virtualMachines/$([Environment]::MachineName)?api-version=*" -and
+                $Headers.Authorization -eq 'Bearer fixture-token'
+            }
+            & $script:noMutation
+        }
+
+        It 'with -WhatIf still tests the identity while a session is open' {
+            Mock quser { $global:LASTEXITCODE = 0; @(' USERNAME  SESSIONNAME  ID  STATE', '>tech1  rdp-tcp#1  2  Active') }
+            $output = & $script:selfDeallocate -WhatIf *>&1 | Out-String
+            $output | Should -BeLike '*Identity check passed*'
+            $output | Should -BeLike '*In use: 1 session(s) present. Would take no action*'
+            & $script:noMutation
+        }
+
+        It 'with -WhatIf reports a missing role when ARM refuses the read' {
+            Mock Invoke-RestMethod { throw 'Response status code does not indicate success: 403 (Forbidden).' } -ParameterFilter {
+                $Method -eq 'Get' -and $Uri -like 'https://management.azure.com/*'
+            }
+            { & $script:selfDeallocate -WhatIf *>&1 | Out-Null } | Should -Throw '*AVD Prod Self Deallocate role*'
+            & $script:noMutation
+        }
+
+        It 'names the requested resource when IMDS refuses the token' {
+            Mock Invoke-RestMethod { throw 'Response status code does not indicate success: 400 (Bad Request).' } -ParameterFilter {
+                $Uri -match 'metadata/identity/oauth2/token'
+            }
+            { & $script:selfDeallocate -WhatIf *>&1 | Out-Null } | Should -Throw "*resource 'https://management.azure.com/'*"
+        }
+
+        It 'never writes the token to output' {
+            foreach ($arguments in @(@{}, @{ WhatIf = $true }, @{ Deferred = $true }, @{ Deferred = $true; WhatIf = $true })) {
+                $output = & $script:selfDeallocate @arguments *>&1 | Out-String
+                $output | Should -Not -BeLike '*fixture-token*'
+            }
+        }
     }
 }
 
@@ -888,20 +1029,31 @@ Describe 'Detect-AvdSelfDeallocate' {
         $output | Should -BeLike '*minimum minutes*'
     }
 
-    It 'exits 0 when a deallocation was accepted during this boot' {
+    It 'exits 0 when a deallocation was scheduled during this boot' {
         Mock Test-Path { $true } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
         Mock Get-ItemProperty {
-            [pscustomobject]@{ DeallocateRequestedUtc = (Get-Date).ToUniversalTime().AddMinutes(-2).ToString('o') }
+            [pscustomobject]@{ DeallocateScheduledUtc = (Get-Date).ToUniversalTime().AddMinutes(-2).ToString('o') }
         } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
         $output = & $script:detect *>&1 | Out-String
         $LASTEXITCODE | Should -Be 0
-        $output | Should -BeLike '*waiting for Azure to stop the VM*'
+        $output | Should -BeLike '*Deallocation scheduled 2 minute(s) ago*'
+    }
+
+    It 'repeats the last self-deallocate result in its output' {
+        Mock quser { $global:LASTEXITCODE = 0; @(' USERNAME  SESSIONNAME  ID  STATE', '>user1  rdp-tcp#1  2  Active') }
+        Mock Test-Path { $true } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
+        Mock Get-ItemProperty {
+            [pscustomobject]@{ LastResult = "2026-01-01T10:20:00Z Deallocation of 'AVD0012345' accepted (0 sessions, up 75 minutes)." }
+        } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
+        $output = & $script:detect *>&1 | Out-String
+        $LASTEXITCODE | Should -Be 0
+        $output | Should -BeLike "*In use: 1 session(s) present. Last self-deallocate: 2026-01-01T10:20:00Z Deallocation of 'AVD0012345' accepted*"
     }
 
     It 'ignores a marker from an earlier boot' {
         Mock Test-Path { $true } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
         Mock Get-ItemProperty {
-            [pscustomobject]@{ DeallocateRequestedUtc = (Get-Date).ToUniversalTime().AddHours(-5).ToString('o') }
+            [pscustomobject]@{ DeallocateScheduledUtc = (Get-Date).ToUniversalTime().AddHours(-5).ToString('o') }
         } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
         & $script:detect *>&1 | Out-Null
         $LASTEXITCODE | Should -Be 1
@@ -910,7 +1062,7 @@ Describe 'Detect-AvdSelfDeallocate' {
     It 'ignores a stale marker so a failed deallocation is retried' {
         Mock Test-Path { $true } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
         Mock Get-ItemProperty {
-            [pscustomobject]@{ DeallocateRequestedUtc = (Get-Date).ToUniversalTime().AddMinutes(-45).ToString('o') }
+            [pscustomobject]@{ DeallocateScheduledUtc = (Get-Date).ToUniversalTime().AddMinutes(-45).ToString('o') }
         } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
         & $script:detect *>&1 | Out-Null
         $LASTEXITCODE | Should -Be 1
@@ -918,7 +1070,7 @@ Describe 'Detect-AvdSelfDeallocate' {
 
     It 'ignores an unparseable marker' {
         Mock Test-Path { $true } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
-        Mock Get-ItemProperty { [pscustomobject]@{ DeallocateRequestedUtc = 'not-a-date' } } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
+        Mock Get-ItemProperty { [pscustomobject]@{ DeallocateScheduledUtc = 'not-a-date' } } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
         & $script:detect *>&1 | Out-Null
         $LASTEXITCODE | Should -Be 1
     }
@@ -978,7 +1130,7 @@ Describe 'Self-deallocate detection and remediation stay in sync' {
         $detectText | Should -BeExactly (& $script:functionText $script:remediateAst $_)
     }
 
-    It 'uses the same <_> value' -ForEach @('markerKey', 'markerValueName') {
+    It 'uses the same <_> value' -ForEach @('markerKey', 'markerValueName', 'resultValueName') {
         $detectValue = & $script:assignedValue $script:detectAst $_
         $detectValue | Should -Not -BeNullOrEmpty
         $detectValue | Should -BeExactly (& $script:assignedValue $script:remediateAst $_)
@@ -987,5 +1139,12 @@ Describe 'Self-deallocate detection and remediation stay in sync' {
     It 'uses the same MinimumUptimeMinutes default' {
         (& $script:parameterDefault $script:detectAst 'MinimumUptimeMinutes') |
             Should -BeExactly (& $script:parameterDefault $script:remediateAst 'MinimumUptimeMinutes')
+    }
+
+    It 'keeps the marker valid well past the deallocation delay' {
+        $markerValid = [int](& $script:parameterDefault $script:detectAst 'MarkerValidMinutes')
+        $delay = [int](& $script:parameterDefault $script:remediateAst 'DeallocateDelayMinutes')
+        $delay | Should -BeGreaterThan 0
+        $markerValid | Should -BeGreaterOrEqual ($delay + 10)
     }
 }
