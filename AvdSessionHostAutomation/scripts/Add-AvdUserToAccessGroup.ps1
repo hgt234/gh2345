@@ -127,8 +127,28 @@ if ($group.isAssignableToRole -eq $true) {
 # $count (without them the owner-only identity gets 403). The answer can lag
 # a recent change; a stale "not a member" only leads to the add below, which
 # then reports the existing membership.
+#
+# This query must not go through 'az rest'. On a Windows agent az is az.cmd,
+# so its arguments pass through cmd.exe, which splits the URL at each '&'.
+# Graph then received only the $filter part, without $count or the
+# ConsistencyLevel header, and answered 403; cmd.exe also tried to run
+# "$select=id" as a command. Only the token comes from az; that command has
+# no special characters. Wait-AvdReadiness.ps1 queries Graph the same way.
 $memberUrl = "https://graph.microsoft.com/v1.0/groups/$AccessGroupId/members?`$filter=id%20eq%20%27$UserObjectId%27&`$select=id&`$count=true"
-$membership = Invoke-AzCliJson -ArgumentList @('rest', '--method', 'GET', '--url', $memberUrl, '--headers', 'ConsistencyLevel=eventual')
+$graphToken = [string](Invoke-AzCliJson -ArgumentList @('account', 'get-access-token', '--resource', 'https://graph.microsoft.com')).accessToken
+try {
+    $membership = Invoke-RestMethod -Method Get -Uri $memberUrl -Headers @{
+        Authorization = "Bearer $graphToken"
+        ConsistencyLevel = 'eventual'
+    }
+}
+catch {
+    $detail = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+    throw "Graph refused the membership check on group '$groupName'. The pipeline's service principal must be an owner of the group. $detail"
+}
+finally {
+    $graphToken = $null
+}
 if (@($membership.value).Count -gt 0) {
     Write-Output "'$RequestedForUpn' is already a member of '$groupName'. Nothing was changed."
     return

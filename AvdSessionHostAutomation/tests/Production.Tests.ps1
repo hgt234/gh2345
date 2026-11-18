@@ -589,14 +589,15 @@ Describe 'Add-AvdUserToAccessGroup' {
     }
 
     BeforeEach {
-        # switch runs every matching case, and a members URL also matches the
-        # plain groups pattern, so the members cases end with break.
+        # The membership query goes through Invoke-RestMethod, not az (see the
+        # cmd.exe regression tests below), so az only supplies its token.
+        Mock Invoke-RestMethod { [pscustomobject]@{ value = @() } }
         Mock az {
             $global:LASTEXITCODE = 0
             $command = $args -join ' '
             switch -Wildcard ($command) {
                 'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { '{"id":"user-1","accountEnabled":true}' }
-                'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*/members*' { '{"value":[]}'; break }
+                'account get-access-token*' { '{"accessToken":"fixture-token"}' }
                 'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*' { '{"id":"11111111-2222-3333-4444-555555555555","displayName":"AVD Users","securityEnabled":true,"groupTypes":[],"onPremisesSyncEnabled":null,"isAssignableToRole":null}' }
                 'rest --method POST*' {
                     $bodyArgument = [string]$args[([array]::IndexOf($args, '--body')) + 1]
@@ -629,15 +630,16 @@ Describe 'Add-AvdUserToAccessGroup' {
     It 'with -WhatIf reads the user, group, and membership but adds nothing' {
         $output = & $script:groupScript @script:groupArguments -WhatIf *>&1 | Out-String
         $output | Should -BeLike "*Would add 'user@contoso.com' to group 'AVD Users'. Nothing was changed.*"
-        Should -Invoke az -Times 1 -Exactly -ParameterFilter { ($args -join ' ') -like '*groups/11111111-2222-3333-4444-555555555555/members*' }
+        Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -like '*groups/11111111-2222-3333-4444-555555555555/members*' }
         Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like 'rest --method POST*' }
     }
 
     It 'checks membership with the advanced query the owner-only identity needs' {
         & $script:groupScript @script:groupArguments -WhatIf *>&1 | Out-Null
-        Should -Invoke az -Times 1 -Exactly -ParameterFilter {
-            $command = $args -join ' '
-            $command -like '*members?$filter=id%20eq%20%27user-1%27*$count=true*' -and $command -like '*--headers ConsistencyLevel=eventual*'
+        Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
+            # -Uri binds as [Uri], whose ToString() decodes %20 and %27.
+            $Uri.OriginalString -like '*members?$filter=id%20eq%20%27user-1%27&$select=id&$count=true' -and
+            $Headers.ConsistencyLevel -eq 'eventual' -and $Headers.Authorization -eq 'Bearer fixture-token'
         }
     }
 
@@ -657,11 +659,12 @@ Describe 'Add-AvdUserToAccessGroup' {
             $command = $args -join ' '
             switch -Wildcard ($command) {
                 'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { '{"id":"user-1","accountEnabled":true}' }
-                'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*/members*' { '{"value":[{"id":"user-1"}]}'; break }
+                'account get-access-token*' { '{"accessToken":"fixture-token"}' }
                 'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*' { '{"id":"g","displayName":"AVD Users","securityEnabled":true,"groupTypes":[],"onPremisesSyncEnabled":null,"isAssignableToRole":null}' }
                 default { throw "Unexpected az call in test: az $command" }
             }
         }
+        Mock Invoke-RestMethod { [pscustomobject]@{ value = @([pscustomobject]@{ id = 'user-1' }) } }
         $output = & $script:groupScript @script:groupArguments *>&1 | Out-String
         $output | Should -BeLike '*already a member*Nothing was changed*'
         Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like 'rest --method POST*' }
@@ -674,7 +677,7 @@ Describe 'Add-AvdUserToAccessGroup' {
             $command = $args -join ' '
             switch -Wildcard ($command) {
                 'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { $global:LASTEXITCODE = 0; '{"id":"user-1","accountEnabled":true}' }
-                'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*/members*' { $global:LASTEXITCODE = 0; '{"value":[]}'; break }
+                'account get-access-token*' { $global:LASTEXITCODE = 0; '{"accessToken":"fixture-token"}' }
                 'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*' { $global:LASTEXITCODE = 0; '{"id":"g","displayName":"AVD Users","securityEnabled":true,"groupTypes":[],"onPremisesSyncEnabled":null,"isAssignableToRole":null}' }
                 'rest --method POST*' { $global:LASTEXITCODE = 1; "ERROR: Bad Request({`"error`":{`"code`":`"Request_BadRequest`",`"message`":`"One or more added object references already exist for the following modified properties: 'members'.`"}})" }
                 default { throw "Unexpected az call in test: az $command" }
@@ -682,6 +685,23 @@ Describe 'Add-AvdUserToAccessGroup' {
         }
         $output = & $script:groupScript @script:groupArguments *>&1 | Out-String
         $output | Should -BeLike '*already a member*'
+    }
+
+    # Regression: on a Windows agent az is az.cmd, and cmd.exe split the
+    # membership URL at each '&'. Graph got the query without $count or the
+    # ConsistencyLevel header and answered 403 Authorization_RequestDenied,
+    # and cmd.exe tried to run "$select=id" as a command. Reproduced with
+    # Windows pwsh and az.cmd; no az argument may contain '&'.
+    It 'never passes an ampersand to az' {
+        & $script:groupScript @script:groupArguments *>&1 | Out-Null
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*&*' }
+        Should -Invoke Invoke-RestMethod -Times 1 -Exactly
+    }
+
+    It 'names group ownership when Graph refuses the membership check' {
+        Mock Invoke-RestMethod { throw 'Response status code does not indicate success: 403 (Forbidden).' }
+        { & $script:groupScript @script:groupArguments *>&1 | Out-Null } | Should -Throw "*refused the membership check on group 'AVD Users'*owner of the group*"
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like 'rest --method POST*' }
     }
 
     It 'names group ownership when Graph refuses to read the group' {
@@ -923,6 +943,21 @@ Describe 'Azure CLI request bodies' {
         $lines = @(Get-Content -LiteralPath $Path | Where-Object { $_ -match "--body" -and $_ -notmatch '^\s*#' })
         foreach ($line in $lines) {
             $line | Should -Match "--body'?,?\s+`"@" -Because "an inline JSON body breaks through az.cmd: $($line.Trim())"
+        }
+    }
+}
+
+Describe 'Azure CLI URLs' {
+    # Regression: cmd.exe treats '&' as a command separator, so a URL with a
+    # query string of more than one parameter cannot go through az.cmd on a
+    # Windows agent. Use Invoke-RestMethod with a token from az instead.
+    It '<Name> passes no literal URL containing an ampersand to az' -TestCases @(
+        Get-ChildItem -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') -Filter '*.ps1' |
+            ForEach-Object { @{ Name = $_.Name; Path = $_.FullName } }
+    ) {
+        $lines = @(Get-Content -LiteralPath $Path | Where-Object { $_ -match "'--url'" -and $_ -notmatch '^\s*#' })
+        foreach ($line in $lines) {
+            $line | Should -Not -Match '&' -Because "cmd.exe splits an az argument at '&': $($line.Trim())"
         }
     }
 }
