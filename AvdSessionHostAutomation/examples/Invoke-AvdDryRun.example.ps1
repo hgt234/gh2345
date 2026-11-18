@@ -19,7 +19,7 @@
        collision, and the gallery image, then runs the ARM what-if and writes
        the report. It skips the registration-token renewal and the deployment.
     3. The report is checked. The run passes only when the VM, its NIC, and
-       the two extensions are Creates, nothing else is created, modified, or
+       the three extensions are Creates, nothing else is created, modified, or
        deleted, and the NIC has no public IP. Existing resources in the
        resource group appear as Ignore; Incremental mode leaves them alone.
 
@@ -77,6 +77,10 @@ $values = [ordered]@{
     Location                  = '<AVD_LOCATION>'
     VmSize                    = '<AVD_VM_SIZE>'
     OsDiskSku                 = '<AVD_OS_DISK_SKU>'
+    # AVD_OS_DISK_SIZE_GB (a number, 256 by default) and
+    # AVD_OS_DISK_PERFORMANCE_TIER ('' for the baseline, or for example P30).
+    OsDiskSizeGB              = '<AVD_OS_DISK_SIZE_GB>'
+    OsDiskPerformanceTier     = '<AVD_OS_DISK_PERFORMANCE_TIER>'
     # Gallery or Marketplace (AVD_IMAGE_SOURCE_TYPE).
     ImageSourceType           = '<AVD_IMAGE_SOURCE_TYPE>'
     # Leave both gallery values '' for Marketplace. A '' version means the
@@ -121,12 +125,14 @@ $deployArguments.WhatIfReportPath = $reportPath
 
 # 3. Check the report against what a first build of this RITM must look like.
 $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json -Depth 100
-$nicName = "$($vmName.ToLowerInvariant())-nic"
+$vmResource = "Microsoft.Compute/virtualMachines/$vmName"
+$nicResource = "Microsoft.Network/networkInterfaces/$($vmName.ToLowerInvariant())-nic"
 $expected = @(
-    "Microsoft.Compute/virtualMachines/$vmName"
-    "Microsoft.Compute/virtualMachines/$vmName/extensions/AADLoginForWindows"
-    "Microsoft.Compute/virtualMachines/$vmName/extensions/MicrosoftPowershellDSC"
-    "Microsoft.Network/networkInterfaces/$nicName"
+    $vmResource
+    "$vmResource/extensions/AADLoginForWindows"
+    "$vmResource/extensions/MicrosoftPowershellDSC"
+    "$vmResource/extensions/ExtendOsVolume"
+    $nicResource
 )
 $problems = [System.Collections.Generic.List[string]]::new()
 $ignored = 0
@@ -146,13 +152,15 @@ foreach ($resource in $expected) {
     if (-not @($summary | Where-Object Resource -EQ $resource)) { $problems.Add("Missing from the what-if: $resource.") }
 }
 
-$vm = @($report.changes | Where-Object { ([string]$_.resourceId -split '/providers/')[-1] -eq $expected[0] })
-$nic = @($report.changes | Where-Object { ([string]$_.resourceId -split '/providers/')[-1] -eq $expected[3] })
+$vm = @($report.changes | Where-Object { ([string]$_.resourceId -split '/providers/')[-1] -eq $vmResource })
+$nic = @($report.changes | Where-Object { ([string]$_.resourceId -split '/providers/')[-1] -eq $nicResource })
 $imageReference = if ($vm.Count -gt 0 -and $vm[0].after) { $vm[0].after.properties.storageProfile.imageReference } else { $null }
 $image = if (-not $imageReference) { '' }
     elseif ($imageReference.PSObject.Properties['id']) { [string]$imageReference.id }
     else { '{0}:{1}:{2}:{3}' -f $imageReference.publisher, $imageReference.offer, $imageReference.sku, $imageReference.version }
 $identity = if ($vm.Count -gt 0 -and $vm[0].after -and $vm[0].after.PSObject.Properties['identity']) { [string]$vm[0].after.identity.type } else { '' }
+$osDisk = if ($vm.Count -gt 0 -and $vm[0].after) { $vm[0].after.properties.storageProfile.PSObject.Properties['osDisk'] } else { $null }
+$osDiskSize = if ($osDisk -and $osDisk.Value.PSObject.Properties['diskSizeGB']) { "$($osDisk.Value.diskSizeGB) GiB" } else { 'not in the report' }
 $publicIp = $false
 if ($nic.Count -gt 0 -and $nic[0].after) {
     $publicIp = @($nic[0].after.properties.ipConfigurations | Where-Object { $_.properties.PSObject.Properties['publicIPAddress'] }).Count -gt 0
@@ -162,6 +170,7 @@ if ($publicIp) { $problems.Add('The NIC has a public IP address.') }
 $summary | Format-Table -AutoSize | Out-String | Write-Output
 Write-Output "Image:     $image"
 Write-Output "Identity:  $identity"
+Write-Output "OS disk:   $osDiskSize (a performance tier is set after deployment, not in the what-if)"
 Write-Output "Public IP: $publicIp"
 Write-Output "Existing resources left alone (Ignore): $ignored"
 Write-Output "Report:    $reportPath"

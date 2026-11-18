@@ -24,6 +24,7 @@ BeforeAll {
         (Get-ChangeFixture 'Create' 'Microsoft.Compute/virtualMachines/AVD0012345' $script:vmAfter)
         (Get-ChangeFixture 'Create' 'Microsoft.Compute/virtualMachines/AVD0012345/extensions/AADLoginForWindows')
         (Get-ChangeFixture 'Create' 'Microsoft.Compute/virtualMachines/AVD0012345/extensions/MicrosoftPowershellDSC')
+        (Get-ChangeFixture 'Create' 'Microsoft.Compute/virtualMachines/AVD0012345/extensions/ExtendOsVolume')
         (Get-ChangeFixture 'Create' 'Microsoft.Network/networkInterfaces/avd0012345-nic' $script:nicAfter)
         (Get-ChangeFixture 'Ignore' 'Microsoft.Compute/virtualMachines/AVD0099999')
     )
@@ -65,6 +66,8 @@ Describe 'Invoke-AvdDryRun example' {
                 Location = 'centralus'
                 VmSize = 'Standard_E4bs_v5'
                 OsDiskSku = 'StandardSSD_LRS'
+                OsDiskSizeGB = '256'
+                OsDiskPerformanceTier = ''
                 ImageSourceType = 'Gallery'
                 GalleryImageDefinitionId = '/subscriptions/sub-1/providers/Microsoft.Compute/galleries/g/images/i'
                 GalleryImageVersionId = '/subscriptions/sub-1/providers/Microsoft.Compute/galleries/g/images/i/versions/1.0.0'
@@ -93,7 +96,7 @@ Describe 'Invoke-AvdDryRun example' {
         Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*--method PATCH*' }
     }
 
-    It 'fails when the what-if touches a resource outside the expected four' {
+    It 'fails when the what-if touches a resource outside the expected five' {
         $changes = $script:cleanChanges + @(Get-ChangeFixture 'Modify' 'Microsoft.Network/virtualNetworks/vnet/subnets/snet')
         Use-AzMock -WhatIfJson (ConvertTo-WhatIfJson $changes)
         { & $script:dryRun @arguments *>&1 | Out-Null } | Should -Throw '*Dry run FAILED*'
@@ -114,7 +117,7 @@ Describe 'Invoke-AvdDryRun example' {
     It 'fails when the NIC would get a public IP' {
         $publicNic = @{ properties = @{ ipConfigurations = @(@{ name = 'ipconfig1'; properties = @{ publicIPAddress = @{ id = '/pip' } } }) } }
         $changes = @($script:cleanChanges | ForEach-Object { $_.Clone() })
-        $changes[3].after = $publicNic
+        $changes[4].after = $publicNic
         Use-AzMock -WhatIfJson (ConvertTo-WhatIfJson $changes)
         { & $script:dryRun @arguments *>&1 | Out-Null } | Should -Throw '*Dry run FAILED*'
     }

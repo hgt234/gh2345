@@ -17,7 +17,18 @@ variables:
   # Existing subnet in the networking resource group.
   AVD_SESSION_HOST_SUBNET_ID: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example-network/providers/Microsoft.Network/virtualNetworks/vnet-example/subnets/snet-sessionhosts
   AVD_VM_SIZE: Standard_E4bs_v5
+  # OS disk. StandardSSD_LRS or Premium_LRS. The size sets the baseline
+  # performance: 256 GiB is E15 on Standard SSD (500 IOPS, 100 MB/s, credit
+  # bursting to 600 IOPS) or P15 on Premium SSD (1,100 IOPS, 125 MB/s, credit
+  # bursting to 3,500 IOPS for up to 30 minutes). Undefined size means 256.
+  # An existing VM keeps its current size; the build never resizes a disk.
   AVD_OS_DISK_SKU: StandardSSD_LRS
+  AVD_OS_DISK_SIZE_GB: '256'
+  # Premium_LRS only: a performance tier above the size's baseline, for
+  # example P30 (5,000 IOPS, 200 MB/s) for developer workloads. Billed at the
+  # tier's price. '' or undefined keeps the baseline. See DEPLOYMENT-GUIDE.md,
+  # "Choosing OS disk performance".
+  AVD_OS_DISK_PERFORMANCE_TIER: ''
   # Gallery or Marketplace. The two gallery values are ignored for Marketplace.
   AVD_IMAGE_SOURCE_TYPE: Gallery
   AVD_GALLERY_IMAGE_DEFINITION_ID: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example-images/providers/Microsoft.Compute/galleries/acgexample/images/win11-avd-personal
@@ -40,12 +51,20 @@ variables:
   #           session-host resource group (or wider) and Desktop
   #           Virtualization User on the application group. The build makes
   #           no role grants for the user, so access.bicep (guide step 4.3)
-  #           is not needed. The request workflow must add the user to the
-  #           group; the build does not check membership.
+  #           is not needed. Set AVD_ACCESS_GROUP_ID below to have the build
+  #           add the user to that group; otherwise the request workflow
+  #           must add them.
   #   Direct: the build grants both roles to the user. Needs access.bicep,
   #           because Contributor cannot write role assignments.
   # Undefined or '' means Direct.
   AVD_USER_ACCESS_MODE: Group
+  # Object ID of the workload's Entra access group. When set, the Assign
+  # stage adds the requested-for user to it as a direct member before binding
+  # the desktop. The assignment connection's service principal must be an
+  # owner of the group; no Graph write permission is needed. The group must
+  # be a cloud security group with assigned membership (not dynamic, not
+  # synced from on-premises, not role-assignable). '' disables the step.
+  AVD_ACCESS_GROUP_ID: '00000000-0000-0000-0000-000000000000'
   # GUID output selfDeallocateRoleDefinitionId of access.bicep. When set, the
   # Assign stage grants each VM's system-assigned identity this role on its
   # own VM so the guest idle task can deallocate it. '' disables the grant.

@@ -6,8 +6,9 @@
 #     with workload, ritmNumber, and requestedForUpn, leaving ritmSysId blank;
 #     no ServiceNow variable group or callback is then used.
 # Networking, host pools, application groups, and workspaces are never created,
-# modified, or deleted. Only the VM, NIC, disk, extensions, registration token,
-# user role assignments, and the personal-host assignment are touched.
+# modified, or deleted. Only the VM, NIC, disk (and its performance tier),
+# extensions, registration token, user role assignments, the user's membership
+# in the workload access group, and the personal-host assignment are touched.
 name: ${{ parameters.ritmNumber }}-$(Date:yyyyMMdd)$(Rev:.r)
 
 trigger: none
@@ -134,6 +135,8 @@ stages:
               LOCATION: $(AVD_LOCATION)
               VM_SIZE: $(AVD_VM_SIZE)
               OS_DISK_SKU: $(AVD_OS_DISK_SKU)
+              OS_DISK_SIZE_GB: $(AVD_OS_DISK_SIZE_GB)
+              OS_DISK_PERFORMANCE_TIER: $(AVD_OS_DISK_PERFORMANCE_TIER)
               IMAGE_SOURCE_TYPE: $(AVD_IMAGE_SOURCE_TYPE)
               GALLERY_IMAGE_DEFINITION_ID: $(AVD_GALLERY_IMAGE_DEFINITION_ID)
               GALLERY_IMAGE_VERSION_ID: $(AVD_GALLERY_IMAGE_VERSION_ID)
@@ -145,7 +148,13 @@ stages:
               inlineScript: |
                 $ErrorActionPreference = 'Stop'
                 New-Item -ItemType Directory -Path '$(artifactDirectory)' -Force | Out-Null
-                & 'scripts/New-AvdSessionHost.ps1' `
+                # An undefined AVD_OS_DISK_SIZE_GB arrives as its literal
+                # macro; only a number is passed, otherwise the 256 GiB default
+                # applies. The tier is passed as-is: the script treats an
+                # empty value or the macro as the baseline tier.
+                $diskArguments = @{}
+                if ($env:OS_DISK_SIZE_GB -match '^\s*\d+\s*$') { $diskArguments.OsDiskSizeGB = [int]$env:OS_DISK_SIZE_GB }
+                & 'scripts/New-AvdSessionHost.ps1' @diskArguments `
                   -SubscriptionId $env:SUBSCRIPTION_ID `
                   -TenantId $env:TENANT_ID `
                   -ResourceGroupName $env:RESOURCE_GROUP `
@@ -159,6 +168,7 @@ stages:
                   -Location $env:LOCATION `
                   -VmSize $env:VM_SIZE `
                   -OsDiskSku $env:OS_DISK_SKU `
+                  -OsDiskPerformanceTier $env:OS_DISK_PERFORMANCE_TIER `
                   -ImageSourceType $env:IMAGE_SOURCE_TYPE `
                   -GalleryImageDefinitionId $env:GALLERY_IMAGE_DEFINITION_ID `
                   -GalleryImageVersionId $env:GALLERY_IMAGE_VERSION_ID `
@@ -269,6 +279,23 @@ stages:
         pool:
           vmImage: windows-latest
         steps:
+          # Runs before the host is bound, so the user's group-based access
+          # exists by the time the desktop is theirs. Skipped when
+          # AVD_ACCESS_GROUP_ID is empty or undefined. The connection's
+          # service principal must own the group (see the access doc).
+          - task: AzureCLI@2
+            displayName: Add the user to the workload access group
+            env:
+              ACCESS_GROUP_ID: $(AVD_ACCESS_GROUP_ID)
+              REQUESTED_FOR_UPN: $(requestedForUpn)
+            inputs:
+              azureSubscription: $(AVD_ASSIGNMENT_SERVICE_CONNECTION)
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                & 'scripts/Add-AvdUserToAccessGroup.ps1' `
+                  -AccessGroupId $env:ACCESS_GROUP_ID `
+                  -RequestedForUpn $env:REQUESTED_FOR_UPN
           - task: AzureCLI@2
             displayName: Grant access and bind the user to the session host
             env:

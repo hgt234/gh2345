@@ -7,11 +7,18 @@ and session-host subnet, the personal host pool, the desktop application
 group, and the workspace. None of those are ever created, modified, or
 deleted here.
 
-Each build: validates the request, deploys the VM (named `AVD<RITM digits>`),
-registers it in the existing host pool, runs pre-flight readiness gates
-(Entra join, Intune enrollment, required base apps, AVD `Available`), reports
-the results back to the build run, assigns the requested user, and - when the
-request came from ServiceNow - writes the lifecycle back to the RITM.
+Each build:
+- validates the request;
+- deploys the VM (named `AVD<RITM digits>`) with the workload's OS disk
+  (256 GiB by default; Premium SSD with a performance tier for heavier
+  workloads), and extends C: to fill the disk;
+- registers it in the existing host pool;
+- runs pre-flight readiness gates (Entra join, Intune enrollment, required
+  base apps, AVD `Available`) and reports the results back to the build run;
+- adds the requested user to the workload's Entra access group when one is
+  configured, then assigns them the desktop;
+- when the request came from ServiceNow, writes the lifecycle back to the
+  RITM.
 
 After the build, each desktop manages its own power: Start VM on Connect
 powers it on when its user connects, and an Intune-deployed guest task
@@ -56,8 +63,9 @@ variable group, so it runs on either model without code changes:
 
 - [infra/session-host.bicep](infra/session-host.bicep) references the subnet
   with `existing` and declares no `Microsoft.DesktopVirtualization` resource.
-  It can only create the VM, NIC, disk, and the Entra-join and AVD-agent
-  extensions.
+  It can only create the VM, NIC, disk, and three extensions: Entra join, AVD
+  agent, and the step that extends C:. The deploy script then sets the
+  disk's performance tier, the one change made outside the template.
 - [scripts/New-AvdSessionHost.ps1](scripts/New-AvdSessionHost.ps1) runs an
   ARM what-if first and blocks the deployment if it contains any Delete or
   Recreate, deploys in Incremental mode, and refuses a VM name that exists
@@ -71,6 +79,9 @@ variable group, so it runs on either model without code changes:
   `AVD_USER_ACCESS_MODE: Group` and self-deallocate off, the build writes no
   role assignments and `access.bicep` is not deployed at all; an Entra group
   supplies the user's access instead.
+- The build can add users only to a workload access group its service
+  principal owns. Owning the group is the permission; no tenant-wide Graph
+  write is granted. The group must be an assigned cloud security group.
 - Host-pool write exists only to renew the registration token; the failure
   path drains the host (`allowNewSession=false`) and preserves the VM for
   investigation.
@@ -144,6 +155,7 @@ Details and rationale in section 8 of
 │   ├── azure-pipelines-avd-provision.yml   the build
 │   └── ci-validate.yml                     PR validation gate
 ├── scripts/                            pipeline steps (PowerShell 7)
+│   ├── Add-AvdUserToAccessGroup.ps1
 │   ├── New-AvdSessionHost.ps1
 │   ├── Set-AvdDrainMode.ps1
 │   ├── Set-AvdPersonalDesktopAssignment.ps1

@@ -7,6 +7,7 @@ BeforeAll {
     $script:deployScript = Join-Path $script:scriptsRoot 'New-AvdSessionHost.ps1'
     $script:readinessScript = Join-Path $script:scriptsRoot 'Wait-AvdReadiness.ps1'
     $script:assignScript = Join-Path $script:scriptsRoot 'Set-AvdPersonalDesktopAssignment.ps1'
+    $script:groupScript = Join-Path $script:scriptsRoot 'Add-AvdUserToAccessGroup.ps1'
     $script:drainScript = Join-Path $script:scriptsRoot 'Set-AvdDrainMode.ps1'
     $script:serviceNowScript = Join-Path $script:scriptsRoot 'Update-ServiceNowRitm.ps1'
     $script:pipelinePath = Join-Path $script:repoRoot 'pipelines/azure-pipelines-avd-provision.yml'
@@ -172,6 +173,115 @@ Describe 'New-AvdSessionHost' {
             $seen.vmName | Should -BeExactly 'AVD0012345'
             Test-Path -LiteralPath $report | Should -BeTrue
             Test-Path -LiteralPath $seen.path | Should -BeFalse
+        }
+    }
+
+    Context 'OS disk' {
+        BeforeEach {
+            # One stateful mock for every disk test. The disk's tier lives in
+            # a TestDrive file so a PATCH can change what the next GET sees;
+            # tier-calls.txt records each disk call for the assertions.
+            Set-Content -LiteralPath (Join-Path $TestDrive 'tier.txt') -Value 'P15'
+            Set-Content -LiteralPath (Join-Path $TestDrive 'vm-list.json') -Value '[]'
+            Mock Start-Sleep { }
+            Mock az {
+                $global:LASTEXITCODE = 0
+                $command = $args -join ' '
+                switch -Wildcard ($command) {
+                    'account show*' { '{"id":"sub-1","tenantId":"tenant-1"}' }
+                    'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { '{"id":"user-1","userPrincipalName":"user@contoso.com","accountEnabled":true}' }
+                    'vm list*' { Get-Content -LiteralPath (Join-Path $TestDrive 'vm-list.json') -Raw }
+                    'rest --method POST --url *retrieveRegistrationToken*' { '{"token":"fixture-token","expirationTime":"2099-01-01T00:00:00Z"}' }
+                    'deployment group what-if*' {
+                        $path = ([string]($args | Where-Object { "$_" -like '@*' } | Select-Object -First 1)).Substring(1)
+                        Copy-Item -LiteralPath $path -Destination (Join-Path $TestDrive 'parameters.json') -WhatIf:$false
+                        '{"changes":[]}'
+                    }
+                    'deployment group create*' { '{"properties":{"outputs":{"vmId":{"value":"/vm"},"osDiskName":{"value":"avd0012345-osdisk"}}}}' }
+                    'rest --method GET --url https://management.azure.com/*/disks/avd0012345-osdisk*' {
+                        $tier = (Get-Content -LiteralPath (Join-Path $TestDrive 'tier.txt') -Raw).Trim()
+                        "{`"properties`":{`"tier`":`"$tier`"}}"
+                    }
+                    'rest --method PATCH --url https://management.azure.com/*/disks/avd0012345-osdisk*' {
+                        $bodyArgument = [string]$args[([array]::IndexOf($args, '--body')) + 1]
+                        $body = Get-Content -LiteralPath $bodyArgument.Substring(1) -Raw | ConvertFrom-Json
+                        Set-Content -LiteralPath (Join-Path $TestDrive 'tier.txt') -Value $body.properties.tier -WhatIf:$false
+                        Add-Content -LiteralPath (Join-Path $TestDrive 'tier-calls.txt') -Value "PATCH $($body.properties.tier)" -WhatIf:$false
+                        ''
+                    }
+                    default { throw "Unexpected az call in test: az $command" }
+                }
+            }
+            $script:premiumArguments = $script:deployArguments.Clone()
+            $script:premiumArguments.OsDiskSku = 'Premium_LRS'
+        }
+
+        It 'deploys a 256 GiB OS disk by default' {
+            & $script:deployScript @script:deployArguments -WhatIf *>&1 | Out-Null
+            (Get-Content -LiteralPath (Join-Path $TestDrive 'parameters.json') -Raw | ConvertFrom-Json).parameters.osDiskSizeGB.value | Should -Be 256
+        }
+
+        It 'passes a configured size and SKU to the template' {
+            & $script:deployScript @script:premiumArguments -OsDiskSizeGB 512 -WhatIf *>&1 | Out-Null
+            $parameters = (Get-Content -LiteralPath (Join-Path $TestDrive 'parameters.json') -Raw | ConvertFrom-Json).parameters
+            $parameters.osDiskSizeGB.value | Should -Be 512
+            $parameters.osDiskSku.value | Should -BeExactly 'Premium_LRS'
+        }
+
+        It 'sets the requested tier after deployment and waits until the disk reports it' {
+            $output = & $script:deployScript @script:premiumArguments -OsDiskPerformanceTier 'p30' *>&1 | Out-String
+            Should -Invoke az -Times 1 -Exactly -ParameterFilter { ($args -join ' ') -like 'rest --method PATCH --url *disks/avd0012345-osdisk?api-version=*--body @*' }
+            (Get-Content -LiteralPath (Join-Path $TestDrive 'tier-calls.txt')) | Should -Be @('PATCH P30')
+            $output | Should -BeLike '*OS disk: Premium_LRS, 256 GiB, tier P30*'
+            $output | Should -BeLike '*##vso`[task.setvariable variable=osDiskName;isOutput=true`]avd0012345-osdisk*'
+        }
+
+        It 'does not patch a disk that already has the tier' {
+            Set-Content -LiteralPath (Join-Path $TestDrive 'tier.txt') -Value 'P30'
+            & $script:deployScript @script:premiumArguments -OsDiskPerformanceTier 'P30' *>&1 | Out-Null
+            Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*--method PATCH*' }
+        }
+
+        It 'leaves the tier alone when none is configured' {
+            & $script:deployScript @script:premiumArguments -OsDiskPerformanceTier '$(AVD_OS_DISK_PERFORMANCE_TIER)' *>&1 | Out-Null
+            Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*disks/*' }
+        }
+
+        It 'with -WhatIf reports the planned tier but never touches the disk' {
+            $output = & $script:deployScript @script:premiumArguments -OsDiskPerformanceTier 'P30' -WhatIf *>&1 | Out-String
+            $output | Should -BeLike '*performance tier P30 set after deployment*No deployment was performed*'
+            Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*disks/*' }
+            Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like 'deployment group create*' }
+        }
+
+        It 'rejects <Name> before any Azure call' -TestCases @(
+            @{ Name = 'a tier on Standard SSD'; Sku = 'StandardSSD_LRS'; Tier = 'P30'; Message = '*needs OsDiskSku Premium_LRS*' }
+            @{ Name = 'an unknown tier'; Sku = 'Premium_LRS'; Tier = 'P35'; Message = '*is not valid*' }
+            @{ Name = 'a P60 tier'; Sku = 'Premium_LRS'; Tier = 'P60'; Message = '*is not valid*' }
+        ) {
+            # Pester supplies $Sku, $Tier, and $Message from the test case. A
+            # param block would trip PSReviewUnusedParameter, because the
+            # first two are used only inside the nested script block.
+            { & $script:deployScript @script:deployArguments -OsDiskSku $Sku -OsDiskPerformanceTier $Tier -WhatIf *>&1 | Out-Null } | Should -Throw $Message
+            Should -Invoke az -Times 0 -Exactly
+        }
+
+        It 'rejects a tier below the baseline of the disk size' {
+            { & $script:deployScript @script:premiumArguments -OsDiskSizeGB 1024 -OsDiskPerformanceTier 'P20' -WhatIf *>&1 | Out-Null } |
+                Should -Throw '*below the P30 baseline of a 1024 GiB disk*'
+            Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like 'deployment group*' }
+        }
+
+        It 'keeps the OS disk size of an existing VM instead of resizing it' {
+            Set-Content -LiteralPath (Join-Path $TestDrive 'vm-list.json') -Value '[{"name":"AVD0012345","tags":{"RITM":"RITM0012345","RequestedFor":"user@contoso.com"},"storageProfile":{"osDisk":{"diskSizeGB":127}}}]'
+            $output = & $script:deployScript @script:deployArguments -WhatIf *>&1 | Out-String
+            $output | Should -BeLike '*already exists with a 127 GiB OS disk; keeping that size*'
+            (Get-Content -LiteralPath (Join-Path $TestDrive 'parameters.json') -Raw | ConvertFrom-Json).parameters.osDiskSizeGB.value | Should -Be 127
+        }
+
+        It 'checks the baseline against the size an existing VM keeps' {
+            Set-Content -LiteralPath (Join-Path $TestDrive 'vm-list.json') -Value '[{"name":"AVD0012345","tags":{"RITM":"RITM0012345","RequestedFor":"user@contoso.com"},"storageProfile":{"osDisk":{"diskSizeGB":1024}}}]'
+            { & $script:deployScript @script:premiumArguments -OsDiskPerformanceTier 'P20' -WhatIf *>&1 | Out-Null } | Should -Throw '*below the P30 baseline*'
         }
     }
 
@@ -473,6 +583,160 @@ Describe 'Set-AvdPersonalDesktopAssignment' {
     }
 }
 
+Describe 'Add-AvdUserToAccessGroup' {
+    BeforeAll {
+        $script:groupId = '11111111-2222-3333-4444-555555555555'
+    }
+
+    BeforeEach {
+        # switch runs every matching case, and a members URL also matches the
+        # plain groups pattern, so the members cases end with break.
+        Mock az {
+            $global:LASTEXITCODE = 0
+            $command = $args -join ' '
+            switch -Wildcard ($command) {
+                'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { '{"id":"user-1","accountEnabled":true}' }
+                'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*/members*' { '{"value":[]}'; break }
+                'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*' { '{"id":"11111111-2222-3333-4444-555555555555","displayName":"AVD Users","securityEnabled":true,"groupTypes":[],"onPremisesSyncEnabled":null,"isAssignableToRole":null}' }
+                'rest --method POST*' {
+                    $bodyArgument = [string]$args[([array]::IndexOf($args, '--body')) + 1]
+                    if ($bodyArgument -like '@*') {
+                        Copy-Item -LiteralPath $bodyArgument.Substring(1) -Destination (Join-Path $TestDrive 'member-body.json') -WhatIf:$false
+                    }
+                    ''
+                }
+                default { throw "Unexpected az call in test: az $command" }
+            }
+        }
+        $script:groupArguments = @{ RequestedForUpn = 'user@contoso.com'; AccessGroupId = $script:groupId }
+    }
+
+    It 'skips the step when the group is <Name>' -TestCases @(
+        @{ Name = 'empty'; Value = '' }
+        @{ Name = 'an unresolved macro'; Value = '$(AVD_ACCESS_GROUP_ID)' }
+    ) {
+        param($Value)
+        $output = & $script:groupScript -RequestedForUpn 'user@contoso.com' -AccessGroupId $Value *>&1 | Out-String
+        $output | Should -BeLike '*No access group is configured*'
+        Should -Invoke az -Times 0 -Exactly
+    }
+
+    It 'rejects a group value that is not an object ID before any Azure call' {
+        { & $script:groupScript -RequestedForUpn 'user@contoso.com' -AccessGroupId 'AVD Users' *>&1 | Out-Null } | Should -Throw '*not a group object ID*'
+        Should -Invoke az -Times 0 -Exactly
+    }
+
+    It 'with -WhatIf reads the user, group, and membership but adds nothing' {
+        $output = & $script:groupScript @script:groupArguments -WhatIf *>&1 | Out-String
+        $output | Should -BeLike "*Would add 'user@contoso.com' to group 'AVD Users'. Nothing was changed.*"
+        Should -Invoke az -Times 1 -Exactly -ParameterFilter { ($args -join ' ') -like '*groups/11111111-2222-3333-4444-555555555555/members*' }
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like 'rest --method POST*' }
+    }
+
+    It 'checks membership with the advanced query the owner-only identity needs' {
+        & $script:groupScript @script:groupArguments -WhatIf *>&1 | Out-Null
+        Should -Invoke az -Times 1 -Exactly -ParameterFilter {
+            $command = $args -join ' '
+            $command -like '*members?$filter=id%20eq%20%27user-1%27*$count=true*' -and $command -like '*--headers ConsistencyLevel=eventual*'
+        }
+    }
+
+    It 'adds the user as a direct member with the body passed as a file' {
+        $output = & $script:groupScript @script:groupArguments *>&1 | Out-String
+        $output | Should -BeLike "*Added 'user@contoso.com' to group 'AVD Users'.*"
+        Should -Invoke az -Times 1 -Exactly -ParameterFilter {
+            ($args -join ' ') -like 'rest --method POST --url https://graph.microsoft.com/v1.0/groups/11111111-2222-3333-4444-555555555555/members/$ref*--body @*'
+        }
+        (Get-Content -LiteralPath (Join-Path $TestDrive 'member-body.json') -Raw | ConvertFrom-Json).'@odata.id' |
+            Should -BeExactly 'https://graph.microsoft.com/v1.0/directoryObjects/user-1'
+    }
+
+    It 'is a no-op when the user is already a member' {
+        Mock az {
+            $global:LASTEXITCODE = 0
+            $command = $args -join ' '
+            switch -Wildcard ($command) {
+                'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { '{"id":"user-1","accountEnabled":true}' }
+                'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*/members*' { '{"value":[{"id":"user-1"}]}'; break }
+                'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*' { '{"id":"g","displayName":"AVD Users","securityEnabled":true,"groupTypes":[],"onPremisesSyncEnabled":null,"isAssignableToRole":null}' }
+                default { throw "Unexpected az call in test: az $command" }
+            }
+        }
+        $output = & $script:groupScript @script:groupArguments *>&1 | Out-String
+        $output | Should -BeLike '*already a member*Nothing was changed*'
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like 'rest --method POST*' }
+    }
+
+    # Lab finding: Graph answers 400 when the member already exists, and the
+    # eventual-consistency membership query can lag a recent add.
+    It 'treats the Graph "already exist" answer as success' {
+        Mock az {
+            $command = $args -join ' '
+            switch -Wildcard ($command) {
+                'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { $global:LASTEXITCODE = 0; '{"id":"user-1","accountEnabled":true}' }
+                'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*/members*' { $global:LASTEXITCODE = 0; '{"value":[]}'; break }
+                'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*' { $global:LASTEXITCODE = 0; '{"id":"g","displayName":"AVD Users","securityEnabled":true,"groupTypes":[],"onPremisesSyncEnabled":null,"isAssignableToRole":null}' }
+                'rest --method POST*' { $global:LASTEXITCODE = 1; "ERROR: Bad Request({`"error`":{`"code`":`"Request_BadRequest`",`"message`":`"One or more added object references already exist for the following modified properties: 'members'.`"}})" }
+                default { throw "Unexpected az call in test: az $command" }
+            }
+        }
+        $output = & $script:groupScript @script:groupArguments *>&1 | Out-String
+        $output | Should -BeLike '*already a member*'
+    }
+
+    It 'names group ownership when Graph refuses to read the group' {
+        Mock az {
+            $command = $args -join ' '
+            switch -Wildcard ($command) {
+                'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { $global:LASTEXITCODE = 0; '{"id":"user-1","accountEnabled":true}' }
+                'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*' { $global:LASTEXITCODE = 1; 'ERROR: Forbidden({"error":{"code":"Authorization_RequestDenied","message":"Insufficient privileges to complete the operation."}})' }
+                default { throw "Unexpected az call in test: az $command" }
+            }
+        }
+        { & $script:groupScript @script:groupArguments *>&1 | Out-Null } | Should -Throw '*service principal is an owner of the group*'
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like 'rest --method POST*' }
+    }
+
+    It 'refuses a <Name> group and adds nothing' -TestCases @(
+        @{ Name = 'dynamic'; Group = '{"id":"g","displayName":"G","securityEnabled":true,"groupTypes":["DynamicMembership"],"onPremisesSyncEnabled":null,"isAssignableToRole":null}'; Message = '*dynamic membership*' }
+        @{ Name = 'synced'; Group = '{"id":"g","displayName":"G","securityEnabled":true,"groupTypes":[],"onPremisesSyncEnabled":true,"isAssignableToRole":null}'; Message = '*synced from on-premises*' }
+        @{ Name = 'role-assignable'; Group = '{"id":"g","displayName":"G","securityEnabled":true,"groupTypes":[],"onPremisesSyncEnabled":null,"isAssignableToRole":true}'; Message = '*role-assignable*' }
+        @{ Name = 'non-security'; Group = '{"id":"g","displayName":"G","securityEnabled":false,"groupTypes":["Unified"],"onPremisesSyncEnabled":null,"isAssignableToRole":null}'; Message = '*not a security group*' }
+    ) {
+        param($Group, $Message)
+        Set-Content -LiteralPath (Join-Path $TestDrive 'group.json') -Value $Group
+        Mock az {
+            $global:LASTEXITCODE = 0
+            $command = $args -join ' '
+            switch -Wildcard ($command) {
+                'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { '{"id":"user-1","accountEnabled":true}' }
+                'rest --method GET --url https://graph.microsoft.com/v1.0/groups/*' { Get-Content -LiteralPath (Join-Path $TestDrive 'group.json') -Raw }
+                default { throw "Unexpected az call in test: az $command" }
+            }
+        }
+        { & $script:groupScript @script:groupArguments *>&1 | Out-Null } | Should -Throw $Message
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like 'rest --method POST*' }
+    }
+
+    It 'refuses a disabled user' {
+        Mock az {
+            $global:LASTEXITCODE = 0
+            $command = $args -join ' '
+            switch -Wildcard ($command) {
+                'rest --method GET --url https://graph.microsoft.com/v1.0/users/*' { '{"id":"user-1","accountEnabled":false}' }
+                default { throw "Unexpected az call in test: az $command" }
+            }
+        }
+        { & $script:groupScript @script:groupArguments *>&1 | Out-Null } | Should -Throw '*not found or is disabled*'
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*groups/*' }
+    }
+
+    It 'skips the UPN lookup when the object ID is supplied' {
+        & $script:groupScript @script:groupArguments -UserObjectId 'user-1' -WhatIf *>&1 | Out-Null
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { ($args -join ' ') -like '*graph.microsoft.com/v1.0/users/*' }
+    }
+}
+
 Describe 'Set-AvdDrainMode' {
     BeforeEach {
         Mock az {
@@ -622,6 +886,23 @@ Describe 'Provision pipeline' {
         $script:pipeline | Should -Match '-UserAccessMode \$env:USER_ACCESS_MODE'
     }
 
+    It 'passes the OS disk size and performance tier to the deploy script' {
+        $script:pipeline | Should -Match 'OS_DISK_SIZE_GB: \$\(AVD_OS_DISK_SIZE_GB\)'
+        $script:pipeline | Should -Match 'OS_DISK_PERFORMANCE_TIER: \$\(AVD_OS_DISK_PERFORMANCE_TIER\)'
+        $script:pipeline | Should -Match '-OsDiskPerformanceTier \$env:OS_DISK_PERFORMANCE_TIER'
+        # Only a number reaches -OsDiskSizeGB; an undefined macro keeps 256.
+        $script:pipeline | Should -Match ([regex]::Escape("if (`$env:OS_DISK_SIZE_GB -match '^\s*\d+\s*`$') { `$diskArguments.OsDiskSizeGB = [int]`$env:OS_DISK_SIZE_GB }"))
+    }
+
+    It 'adds the user to the workload access group before binding the desktop' {
+        $script:pipeline | Should -Match 'ACCESS_GROUP_ID: \$\(AVD_ACCESS_GROUP_ID\)'
+        $script:pipeline | Should -Match '-AccessGroupId \$env:ACCESS_GROUP_ID'
+        $groupStep = $script:pipeline.IndexOf('Add-AvdUserToAccessGroup.ps1')
+        $groupStep | Should -BeGreaterThan $script:pipeline.IndexOf('Wait-AvdReadiness.ps1')
+        $script:pipeline.IndexOf('Set-AvdPersonalDesktopAssignment.ps1') | Should -BeGreaterThan $groupStep
+        $script:pipeline | Should -Match '(?s)Add the user to the workload access group.*?azureSubscription: \$\(AVD_ASSIGNMENT_SERVICE_CONNECTION\)'
+    }
+
     It 'reports readiness back to the build run' {
         $script:pipeline | Should -Match 'task\.uploadsummary'
     }
@@ -664,6 +945,19 @@ Describe 'Infrastructure safety' {
     It 'session host carries the production lifecycle tags' {
         $script:sessionHost | Should -Match "ManagedBy: 'AvdProduction'"
         $script:sessionHost | Should -Match 'RITM: ritmNumber'
+    }
+
+    It 'session host sizes the OS disk at 256 GiB by default' {
+        $script:sessionHost | Should -Match 'param osDiskSizeGB int = 256'
+        $script:sessionHost | Should -Match 'diskSizeGB: osDiskSizeGB'
+        $script:sessionHost | Should -Match ([regex]::Escape('output osDiskName string = vm.properties.storageProfile.osDisk.name'))
+    }
+
+    # Lab finding: a 256 GiB disk from the Windows 11 24H2 image kept a
+    # 126 GiB C: volume until the partition was extended.
+    It 'session host extends C: only when there is space to gain' {
+        $script:sessionHost | Should -Match "(?s)resource extendOsVolume.*?type: 'CustomScriptExtension'"
+        $script:sessionHost | Should -Match ([regex]::Escape('if ($maximum -gt ($partition.Size + 1GB)) { Resize-Partition -DriveLetter C -Size $maximum'))
     }
 
     It 'access roles grant no delete action or network write' {

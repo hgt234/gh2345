@@ -145,8 +145,10 @@ Entra group the request workflow adds users to holds:
   Entra-joined hosts check this role against the VM.
 - **Desktop Virtualization User** on the desktop application group.
 
-The build does not check group membership. The user must be in the group
-before they sign in, or the desktop is ready but the sign-in is refused.
+Set `AVD_ACCESS_GROUP_ID` to this group's object ID to have the build add
+the user to it (step 4.4). Without it, the build does not check membership:
+the request workflow must add the user before they sign in, or the desktop
+is ready but the sign-in is refused.
 
 Otherwise, the administrator activates the JIT elevation from the access doc, then runs
 the following from the repository root. Under the shared-connection model,
@@ -175,6 +177,43 @@ When this step applies, it is required even under Contributor: Contributor
 cannot write role assignments, and the build grants the end user's sign-in
 and desktop roles (Direct mode) or the VM's self-deallocate role.
 
+### 4.4 Access group ownership (when the build adds users to a group)
+
+When a workload sets `AVD_ACCESS_GROUP_ID`, the Assign stage adds the
+requested-for user to that Entra group. The service principal behind the
+assignment connection must be an **owner** of the group. It needs no Graph
+write permission. Owner rights reach only the groups it owns: a lab test with
+an app-only token (Graph `User.Read.All` only) added a member to the group
+it owned and got 403 on a group it did not own. The full test is in section
+2 of the access doc.
+
+1. The Entra team adds the service principal as an owner: in the Entra admin
+   center, open the group > **Owners** > **Add owners** and search for the
+   app's name, or run:
+
+   ```powershell
+   az rest --method post --url "https://graph.microsoft.com/v1.0/groups/<group-object-id>/owners/`$ref" `
+       --headers Content-Type=application/json --body '@owner.json'
+   ```
+
+   where `owner.json` holds
+   `{"@odata.id":"https://graph.microsoft.com/v1.0/directoryObjects/<sp-object-id>"}`.
+   Use the service principal's **object ID**, not the application ID.
+2. The group must be a cloud security group with **Assigned** membership.
+   The build refuses a dynamic group, a group synced from on-premises AD,
+   and a role-assignable group.
+3. Record the group's object ID; it becomes `AVD_ACCESS_GROUP_ID` in step 5.
+
+In the lab, listing the group's owners through Graph with an Azure CLI
+sign-in returned no service principal, even though the ownership was in
+place. To confirm ownership, check the service principal's side instead:
+`az rest --method get --url https://graph.microsoft.com/v1.0/servicePrincipals/<sp-object-id>/ownedObjects`
+lists the group.
+
+Ownership also lets the service principal change the group's settings and
+owners, or delete it. Anyone who can change the pipeline YAML acts with
+those rights, so the branch protection in step 9 covers this too.
+
 ## 5. Variable groups
 
 **Who:** ADO engineer.
@@ -194,6 +233,11 @@ and desktop roles (Direct mode) or the VM's self-deallocate role.
      build grant the roles per user;
    - set `AVD_SELF_DEALLOCATE_ROLE_ID` to the GUID from step 4.3, or `''`
      when step 4.3 was skipped;
+   - set `AVD_ACCESS_GROUP_ID` to the access group's object ID from step
+     4.4, or `''` to leave group membership to the request workflow;
+   - set the OS disk with `AVD_OS_DISK_SKU`, `AVD_OS_DISK_SIZE_GB`, and
+     `AVD_OS_DISK_PERFORMANCE_TIER` (see 5.3). The defaults are Standard SSD,
+     256 GiB, and the baseline tier;
    - set `AVD_REQUIRED_APP_NAMES_JSON` to the exact installed DisplayNames of
      the base applications, for example `["App One","App Two"]`. Use the full
      names, not substrings. `[]` disables the app gate.
@@ -208,6 +252,82 @@ Create `avd-prod-servicenow` from
 Click the lock icon on `SN_CLIENT_SECRET` (and `SN_PASSWORD` if Basic auth is
 used) to make them secret. Technician-only builds never load this group, so it
 can wait.
+
+### 5.3 Choosing OS disk performance
+
+Every build gets a **256 GiB** OS disk unless `AVD_OS_DISK_SIZE_GB` says
+otherwise. The Windows image's C: volume is about 127 GiB. Windows does not
+grow it to fill a larger disk, so the template's `ExtendOsVolume` step
+extends C: at build time. A lab build went from 126.4 GiB to 255.4 GiB with
+no reboot.
+
+The disk's size and type set its baseline performance. For Premium SSD, a
+**performance tier** raises IOPS and throughput without changing the size.
+Changing the tier needs no downtime, and Azure bills the disk at the tier's
+price.
+
+| Workload setting | Disk | Provisioned IOPS | Throughput | Burst (credit-based, up to 30 min) | List price, centralus |
+|---|---|---|---|---|---|
+| `StandardSSD_LRS`, tier `''` (default) | E15 | up to 500 | up to 100 MB/s | 600 IOPS, 150 MB/s | $19.20/month plus $0.002 per 10,000 operations |
+| `Premium_LRS`, tier `''` | P15 | 1,100 | 125 MB/s | 3,500 IOPS, 170 MB/s | $38.01/month |
+| `Premium_LRS`, tier `P20` | P20 | 2,300 | 150 MB/s | 3,500 IOPS, 170 MB/s | $73.22/month |
+| `Premium_LRS`, tier `P30` | P30 | 5,000 | 200 MB/s | none needed: the baseline exceeds the burst ceiling | $135.17/month |
+| `Premium_LRS`, tier `P40` | P40 | 7,500 | 250 MB/s | none needed | $259.05/month |
+
+Performance figures are from
+[Scalability and performance targets for VM disks](https://learn.microsoft.com/azure/virtual-machines/disks-scalability-targets),
+[Managed disk bursting](https://learn.microsoft.com/azure/virtual-machines/disk-bursting),
+and [Performance tiers](https://learn.microsoft.com/azure/virtual-machines/disks-change-performance).
+Prices are Azure retail list prices from November 2026, before any discounts.
+Disks are billed while the VM is deallocated, so the tier costs the same
+whether or not the desktop is in use.
+
+**The VM size caps disk performance too.** `Standard_E4bs_v5` allows 12,100
+uncached IOPS and 340 MB/s, so every tier above fits. `Standard_E2bs_v5`
+allows 6,050 IOPS and 170 MB/s, which is below P30's 200 MB/s. The OS disk
+uses ReadWrite host caching, so repeated reads of the same files are served
+from the host cache rather than the disk.
+
+**Recommendation for developer workloads.** Windows developers working in VS
+Code who compile and debug read and write many small files: sources, package
+caches, and build output. That load is limited by IOPS and latency more than
+by throughput.
+
+- **P15 (Premium, baseline)** already bursts to 3,500 IOPS. The credits last
+  about 30 minutes at full rate and refill in under a day, which covers
+  short builds.
+- **P20** raises the sustained rate to 2,300 IOPS but keeps the same 3,500
+  burst ceiling as P15, for about twice the price. It is the weakest value
+  of the options.
+- **P30** is the first tier whose sustained rate (5,000 IOPS, 200 MB/s) is
+  above the burst ceiling. Long or back-to-back builds never drop to a
+  throttled baseline.
+
+Start the developer workloads on `Premium_LRS` with `P30`, then measure for
+two weeks with the VM's Azure Monitor metrics:
+- **OS Disk IOPS Consumed Percentage**
+- **OS Disk Bandwidth Consumed Percentage**
+- **OS Disk Latency**
+- **OS Disk Used Burst IO Credits Percentage**
+
+If consumption stays well below 100% during builds, move the workload to
+`P20` or the P15 baseline. If it sits near 100%, check the VM size's limits
+before raising the tier further.
+
+Separately from the disk, Windows 11's
+[Dev Drive](https://learn.microsoft.com/windows/dev-drive/) targets build
+performance by reducing Defender scanning overhead on source and package
+folders. It is not configured by this build and has not been tested here.
+
+**Changing an existing desktop.** A variable change applies to new builds
+only. To change one existing disk:
+
+```powershell
+az disk update --resource-group <vm-rg> --name <vm-name-lowercase>-osdisk --set tier=P20
+```
+
+Azure allows a tier downgrade once every 12 hours. A rebuild of the same RITM
+also converges the tier, but it never resizes an existing disk.
 
 ## 6. Power management
 
@@ -428,8 +548,8 @@ Run in this order, using a test RITM number and a licensed test user:
 
    It runs the Provision stage's checks and the real ARM what-if, always with
    `-WhatIf`, so it never renews the token or deploys. It passes only when the
-   VM, NIC, and two extensions are creates, nothing else changes, and the NIC
-   has no public IP. It runs as you, not the service connection: ARM what-if
+   VM, NIC, and three extensions are creates, nothing else changes, and the
+   NIC has no public IP. It runs as you, not the service connection: ARM what-if
    needs the same rights as the deployment (Contributor on the session-host
    resource group is enough) plus Graph read on the user. The report holds
    tenant resource IDs and is written to your temp folder; delete it after.
@@ -441,7 +561,13 @@ Run in this order, using a test RITM number and a licensed test user:
    - the user can sign in to the desktop;
    - when self-deallocate is configured, the VM identity holds
      `AVD Prod Self Deallocate` on its own VM;
-   - in Group mode, the build created no role assignment for the user.
+   - in Group mode, the build created no role assignment for the user;
+   - when `AVD_ACCESS_GROUP_ID` is set, the Assign stage log shows "Added
+     '<upn>' to group" (or "already a member") and the user is a direct
+     member of the group;
+   - the OS disk has the workload's SKU, size, and tier
+     (`az disk show -g <vm-rg> -n <vm-name-lowercase>-osdisk --query "{sku:sku.name,size:diskSizeGB,tier:tier}"`),
+     and C: in the guest fills the disk.
 5. **Power cycle** (after the step 6 Remediations package is assigned):
    leave the desktop idle with the user signed out. Confirm:
    - the package's device status shows the issue fixed, with post-remediation

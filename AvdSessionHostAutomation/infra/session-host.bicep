@@ -68,6 +68,18 @@ param mdmId string = '0000000a-0000-0000-c000-000000000000'
 ])
 param osDiskSku string = 'StandardSSD_LRS'
 
+// The disk size sets the baseline performance: 256 GiB is an E15 (Standard
+// SSD) or a P15 (Premium SSD). A Premium SSD performance tier above the
+// baseline cannot be set here, because the VM's managedDisk block has no tier
+// property; New-AvdSessionHost.ps1 sets it on the disk after deployment.
+// The minimum is below New-AvdSessionHost.ps1's 128 GiB floor for new builds
+// on purpose: converging an existing VM passes back its current size, and
+// VMs built before this parameter existed have the image's 127 GiB disk.
+@description('OS disk size in GiB. Must not be smaller than the image.')
+@minValue(64)
+@maxValue(2048)
+param osDiskSizeGB int = 256
+
 @description('Enable accelerated networking only when the selected VM SKU supports it.')
 param acceleratedNetworking bool = true
 
@@ -143,6 +155,7 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-03-01' = {
         createOption: 'FromImage'
         deleteOption: 'Delete'
         caching: 'ReadWrite'
+        diskSizeGB: osDiskSizeGB
         managedDisk: {
           storageAccountType: osDiskSku
         }
@@ -228,7 +241,32 @@ resource avdRegistration 'Microsoft.Compute/virtualMachines/extensions@2024-03-0
   ]
 }
 
+// Windows does not grow C: when the OS disk is larger than the image: a lab
+// build from the Windows 11 24H2 Marketplace image had a 256 GiB disk but a
+// 126 GiB C: volume. This extends C: into the unallocated space at the end of
+// the disk. It does nothing when there is no space to gain (for example an
+// image whose recovery partition follows C:), and an unchanged command is
+// not run again when an existing VM is converged.
+resource extendOsVolume 'Microsoft.Compute/virtualMachines/extensions@2024-03-01' = {
+  parent: vm
+  name: 'ExtendOsVolume'
+  location: location
+  properties: {
+    publisher: 'Microsoft.Compute'
+    type: 'CustomScriptExtension'
+    typeHandlerVersion: '1.10'
+    autoUpgradeMinorVersion: true
+    settings: {
+      commandToExecute: 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = \'Stop\'; $partition = Get-Partition -DriveLetter C; $maximum = (Get-PartitionSupportedSize -DriveLetter C).SizeMax; if ($maximum -gt ($partition.Size + 1GB)) { Resize-Partition -DriveLetter C -Size $maximum; \'Extended C: to {0:N1} GiB.\' -f ($maximum / 1GB) } else { \'C: already uses the available space.\' }"'
+    }
+  }
+  dependsOn: [
+    avdRegistration
+  ]
+}
+
 output vmId string = vm.id
 output vmName string = vm.name
 output privateNicId string = nic.id
 output principalId string = vm.identity.principalId
+output osDiskName string = vm.properties.storageProfile.osDisk.name

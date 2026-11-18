@@ -32,7 +32,7 @@ roles on top of its Contributor grant.
 |---|---|---|---|---|
 | `sc-avd-prod-deploy` | Entra app registration + WIF service connection | `AVD Prod Deploy VMs` (VM resource group), `AVD Prod Join Subnet` (network resource group), `AVD Prod Register Hosts` (host pool resource group) | Microsoft Graph `User.Read.All` | Deploys the VM, NIC, disk, and extensions; joins the existing subnet; gets or renews the host pool registration token |
 | `sc-avd-prod-readiness` | Entra app registration + WIF service connection | `AVD Prod Check VMs` (VM resource group, includes VM Run Command), `AVD Prod Read Hosts` (host pool resource group) | Microsoft Graph `Device.Read.All`, `DeviceManagementManagedDevices.Read.All`; WindowsDefenderATP `Machine.Read.All` only if the MDE gate is enabled | Verifies the VM is running, Entra-joined, Intune-enrolled, has the base apps installed, and is Available in the pool |
-| `sc-avd-prod-assignment` | Entra app registration + WIF service connection | `AVD Prod Assign VM Login` (VM resource group), `AVD Prod Assign Desktop` (host pool resource group); both ABAC-constrained | Microsoft Graph `User.Read.All` | Grants the end user sign-in and desktop access, binds the personal host to them, and drains failed hosts |
+| `sc-avd-prod-assignment` | Entra app registration + WIF service connection | `AVD Prod Assign VM Login` (VM resource group), `AVD Prod Assign Desktop` (host pool resource group); both ABAC-constrained | Microsoft Graph `User.Read.All`; **owner** of the workload access group when `AVD_ACCESS_GROUP_ID` is set (no Graph write permission) | Grants the end user sign-in and desktop access, adds them to the access group, binds the personal host to them, and drains failed hosts |
 | ServiceNow callback OAuth client + `avd.integration` | ServiceNow inbound OAuth client credentials bound to a web-service-only user | None | `PATCH /api/now/table/sc_req_item/{sys_id}` only; write limited to the AVD status/hostname fields and `work_notes` | Lets the pipeline report Queued / In Progress / Ready / Failed back to the RITM |
 | ServiceNow-to-ADO queue identity | Azure DevOps PAT (interim) held in a ServiceNow credential | None | PAT scope **Build: Read & execute**; `Queue builds` granted only on this one pipeline | Lets ServiceNow start the build. Not needed until the ServiceNow side goes live; technicians queue builds with their own accounts until then |
 | One-time administrator | Human, PIM/JIT | Rights to create role definitions and role assignments at the three resource groups (for example JIT **User Access Administrator** at those scopes) | None | Deploys `infra/access.bicep` once per workload, then drops the elevation |
@@ -92,7 +92,35 @@ shared connection:**
    `Device.Read.All`, `DeviceManagementManagedDevices.Read.All`, plus
    WindowsDefenderATP `Machine.Read.All` only if the MDE gate is enabled -
    all Application type, with admin consent.
-3. **Key Vault, only if adopted later.** If pipeline secrets (for example the
+3. **Ownership of each workload's access group, only when
+   `AVD_ACCESS_GROUP_ID` is set.** The Assign stage adds the requested-for
+   user to the workload's Entra access group. The identity needs no Graph
+   write permission for this. It must be an **owner** of the group and hold
+   `User.Read.All`, which it already has.
+
+   Microsoft's documentation disagrees here, so this was tested. The Graph
+   [Add members](https://learn.microsoft.com/graph/api/group-post-members)
+   reference lists `GroupMember.ReadWrite.All` for app-only callers, and
+   names group owners only for calls made on behalf of a user. Configuration
+   Manager's documented
+   [collection sync](https://learn.microsoft.com/intune/configmgr/core/clients/manage/collections/synchronize-collections-aad-group)
+   relies on owner rights instead: its server app owns the target group and
+   holds only the read-only `Directory.Read.All`.
+
+   A lab test on 2026-11-18 used app-only service principals that owned one
+   group and not another:
+   - With no Graph permission at all, it added and removed members of the
+     group it owned.
+   - With `User.Read.All` only, the pipeline's set, the build's
+     `Add-AvdUserToAccessGroup.ps1` added the user and was a no-op on rerun.
+   - Both got 403 `Authorization_RequestDenied` on the group they did not
+     own, whether reading or writing.
+
+   `GroupMember.ReadWrite.All` would instead cover every group in the tenant,
+   so ownership is the narrower grant. Ownership also allows changing the
+   group's settings and owners and deleting it. The lab test confirmed both,
+   and the branch protection on the pipeline YAML is what limits that use.
+4. **Key Vault, only if adopted later.** If pipeline secrets (for example the
    ServiceNow client secret) move from the protected variable group to a Key
    Vault-linked group, the same identity needs **Key Vault Secrets User** on
    that vault (RBAC vaults) or a get/list access policy. Nothing in the
@@ -132,10 +160,13 @@ admin consent.
 - *Deploy VMs* (VM resource group) holds ARM deployment, VM/NIC/disk/extension
   write, and Compute read. It has no delete action, so a bad run can create or
   converge a VM but never remove one. Extension write is the one privileged
-  operation: it installs the Entra join and AVD agent extensions, which run as
-  SYSTEM in the guest. That is inherent to building a session host; the
-  compensating controls are the pipeline-only service-connection
-  authorization and Activity Log monitoring.
+  operation: it installs the Entra join, AVD agent, and C:-extension
+  (`ExtendOsVolume`, a fixed Custom Script Extension command in the template)
+  extensions, which run as SYSTEM in the guest. That is inherent to building
+  a session host; the compensating controls are the pipeline-only
+  service-connection authorization and Activity Log monitoring. Disk write
+  also covers setting a Premium SSD OS disk's performance tier after
+  deployment, when the workload configures one.
 - *Join Subnet* (network resource group) is read plus `subnets/join/action`
   only. The identity can attach a NIC to the existing subnet but cannot
   create, change, or delete any network resource, so the peered network stack
@@ -205,6 +236,10 @@ consent.
   and is also used to put a failed host into drain mode so nobody signs in
   to a desktop that failed its checks. There is still no delete action.
 - Graph `User.Read.All` re-resolves the UPN at assignment time.
+- When the workload sets `AVD_ACCESS_GROUP_ID`, this identity adds the user
+  to the workload's Entra access group. It must be an owner of that group;
+  no Graph write permission is requested (see item 3 of section 2 for the
+  test behind this).
 
 ## 4. ServiceNow identities
 
@@ -278,6 +313,9 @@ workload identities above.
       connections; each is authorized only for this pipeline.
 - [ ] Graph/MDE permissions show **Application** type with admin consent, and
       match the quick-reference table exactly - nothing extra.
+- [ ] For each workload with `AVD_ACCESS_GROUP_ID` set, the assignment
+      identity is an owner of that group (its `ownedObjects` lists the
+      group), and the group is an assigned-membership cloud security group.
 - [ ] The eight custom roles contain no delete action
       (`az role definition list --custom-role-only true` and inspect).
 - [ ] The two assignment roles carry the ABAC condition restricting
@@ -446,8 +484,15 @@ APPLICATION permissions with admin consent:
 Optional, only if the MDE readiness gate is enabled:
   WindowsDefenderATP Machine.Read.All
 
+Only for workloads where the build adds users to an access group: add the
+same service principal (object ID <sp-object-id>) as an OWNER of each
+workload access group below. No Graph write permission is requested. Each
+group must be a cloud security group with Assigned membership (not dynamic,
+not synced from on-premises, not role-assignable).
+  <workload>: <group-name> (<group-object-id>)
+
 Authentication stays workload identity federation; create no client secret.
-Return the consent status. Send no secrets.
+Return the consent status and the owner assignments. Send no secrets.
 ```
 
 ### Azure subscription team

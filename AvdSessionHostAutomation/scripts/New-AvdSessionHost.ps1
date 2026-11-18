@@ -11,6 +11,10 @@
     when at least 30 minutes remain (otherwise renews it), and then deploys the
     reference-only session-host Bicep template additively.
 
+    The OS disk is 256 GiB by default. When a Premium SSD performance tier is
+    configured, it is set on the disk after the deployment, because the
+    VM's managedDisk block has no tier property.
+
     Safety rails: the VM name must be RITM-derived; an existing VM with the
     same name is only converged when its RITM and requested-for tags match the
     request; the ARM what-if result is evaluated first and any Delete or
@@ -79,6 +83,22 @@
 .PARAMETER OsDiskSku
     OS disk SKU.
 
+.PARAMETER OsDiskSizeGB
+    OS disk size in GiB for a new VM; 256 by default. The size sets the
+    disk's baseline performance (256 GiB is E15 on Standard SSD, P15 on
+    Premium SSD). An existing VM keeps its current OS disk size: the build
+    never resizes a disk.
+
+.PARAMETER OsDiskPerformanceTier
+    Optional Premium SSD performance tier for the OS disk, for example P30.
+    Empty keeps the size's baseline tier. Requires OsDiskSku Premium_LRS and
+    a tier at or above the baseline. The VM's managedDisk block has no tier
+    property, so the tier is set on the disk after deployment. The change
+    needs no downtime, and Azure bills the disk at the tier's rate. A lower
+    value than the disk's current tier downgrades it; Azure allows a
+    downgrade once every 12 hours.
+    https://learn.microsoft.com/azure/virtual-machines/disks-change-performance
+
 .PARAMETER RegistrationTokenLifetimeMinutes
     Lifetime of a newly created registration token.
 
@@ -109,6 +129,10 @@ param(
     [string]$VmSize = 'Standard_E4bs_v5',
     [string]$LocalAdminUsername = 'avdlocaladmin',
     [ValidateSet('StandardSSD_LRS', 'Premium_LRS')][string]$OsDiskSku = 'StandardSSD_LRS',
+    [ValidateRange(128, 2048)][int]$OsDiskSizeGB = 256,
+    # Not a ValidateSet: an undefined variable arrives as the literal
+    # $(AVD_OS_DISK_PERFORMANCE_TIER) macro and must mean "baseline".
+    [string]$OsDiskPerformanceTier = '',
     [ValidateRange(30, 1440)][int]$RegistrationTokenLifetimeMinutes = 1440,
     [string]$WhatIfReportPath
 )
@@ -130,6 +154,49 @@ function Invoke-AzCliJson {
 function Get-RandomPassword {
     $random = [Security.Cryptography.RandomNumberGenerator]::GetBytes(24)
     return ([Convert]::ToBase64String($random).TrimEnd('=') + '!aA7')
+}
+
+# Premium SSD tiers in ascending order with the largest size each covers, in
+# GiB. A disk's baseline tier is the first one whose size is at least the
+# disk's size. P60 and above need disks over 4 TiB, so they are not offered.
+# https://learn.microsoft.com/azure/virtual-machines/disks-change-performance
+$premiumTierSizes = [ordered]@{ P10 = 128; P15 = 256; P20 = 512; P30 = 1024; P40 = 2048; P50 = 4096 }
+
+function Get-PremiumBaselineTier {
+    param([Parameter(Mandatory)][int]$SizeGB)
+    foreach ($entry in $premiumTierSizes.GetEnumerator()) {
+        if ($SizeGB -le $entry.Value) { return $entry.Key }
+    }
+    throw "No Premium SSD tier covers a $SizeGB GiB disk."
+}
+
+function Test-TierBelowBaseline {
+    param([Parameter(Mandatory)][string]$Tier, [Parameter(Mandatory)][int]$SizeGB)
+    $order = @($premiumTierSizes.Keys)
+    return [array]::IndexOf($order, $Tier) -lt [array]::IndexOf($order, (Get-PremiumBaselineTier -SizeGB $SizeGB))
+}
+
+function Get-DiskTier {
+    param([Parameter(Mandatory)][string]$Url)
+    $disk = Invoke-AzCliJson -ArgumentList @('rest', '--method', 'GET', '--url', $Url)
+    $tierProperty = $disk.properties.PSObject.Properties['tier']
+    if ($tierProperty) { return [string]$tierProperty.Value }
+    return ''
+}
+
+$OsDiskPerformanceTier = if ($OsDiskPerformanceTier -match '^\$\([A-Za-z0-9_.-]+\)$' -or [string]::IsNullOrWhiteSpace($OsDiskPerformanceTier)) {
+    ''
+}
+else {
+    $OsDiskPerformanceTier.Trim().ToUpperInvariant()
+}
+if ($OsDiskPerformanceTier) {
+    if ($OsDiskPerformanceTier -notin @($premiumTierSizes.Keys)) {
+        throw "OsDiskPerformanceTier '$OsDiskPerformanceTier' is not valid. Use one of $(@($premiumTierSizes.Keys) -join ', '), or leave it empty for the baseline."
+    }
+    if ($OsDiskSku -ne 'Premium_LRS') {
+        throw "OsDiskPerformanceTier needs OsDiskSku Premium_LRS; performance tiers exist only for Premium SSD (OsDiskSku is '$OsDiskSku')."
+    }
 }
 
 if ($ImageSourceType -eq 'Gallery' -and
@@ -159,6 +226,7 @@ $user = Invoke-AzCliJson -ArgumentList @(
 if (-not $user -or -not $user.id) { throw "Entra user '$RequestedForUpn' was not found." }
 if ($user.accountEnabled -ne $true) { throw "Entra user '$RequestedForUpn' is disabled." }
 
+$effectiveOsDiskSizeGB = $OsDiskSizeGB
 # A name collision is only acceptable when it is the same request converging:
 # the existing VM must carry this exact RITM and requested-for owner.
 $existingVms = @(Invoke-AzCliJson -ArgumentList @('vm', 'list', '--resource-group', $ResourceGroupName, '--subscription', $SubscriptionId))
@@ -169,6 +237,24 @@ if ($existingVm) {
     if ($existingRitm -cne $RitmNumber -or $existingUser -ine $RequestedForUpn) {
         throw "VM '$VmName' already exists but is owned by RITM '$existingRitm' for '$existingUser'."
     }
+    # Converging an existing VM must not resize its OS disk: a VM built
+    # before the size was configurable has the image's size, and resizing an
+    # OS disk needs the VM deallocated. Keep whatever size it has.
+    # Read defensively: Set-StrictMode throws on a missing property.
+    $existingSize = 0
+    $storageProfile = $existingVm.PSObject.Properties['storageProfile']
+    $osDisk = if ($storageProfile -and $storageProfile.Value) { $storageProfile.Value.PSObject.Properties['osDisk'] } else { $null }
+    $sizeProperty = if ($osDisk -and $osDisk.Value) { $osDisk.Value.PSObject.Properties['diskSizeGB'] } else { $null }
+    if ($sizeProperty -and $sizeProperty.Value) { $existingSize = [int]$sizeProperty.Value }
+    if ($existingSize -gt 0 -and $existingSize -ne $OsDiskSizeGB) {
+        Write-Warning "VM '$VmName' already exists with a $existingSize GiB OS disk; keeping that size instead of $OsDiskSizeGB GiB."
+        # A separate variable: the parameter's range check would reject an
+        # older VM's 127 GiB image-sized disk if it were assigned back.
+        $effectiveOsDiskSizeGB = $existingSize
+    }
+}
+if ($OsDiskPerformanceTier -and (Test-TierBelowBaseline -Tier $OsDiskPerformanceTier -SizeGB $effectiveOsDiskSizeGB)) {
+    throw "OsDiskPerformanceTier '$OsDiskPerformanceTier' is below the $(Get-PremiumBaselineTier -SizeGB $effectiveOsDiskSizeGB) baseline of a $effectiveOsDiskSizeGB GiB disk. Use the baseline or a higher tier."
 }
 
 if ($ImageSourceType -eq 'Gallery' -and [string]::IsNullOrWhiteSpace($GalleryImageVersionId)) {
@@ -271,6 +357,7 @@ try {
             localAdminUsername = @{ value = $LocalAdminUsername }
             localAdminPassword = @{ value = (Get-RandomPassword) }
             osDiskSku = @{ value = $OsDiskSku }
+            osDiskSizeGB = @{ value = $effectiveOsDiskSizeGB }
         }
     }
     # The temporary parameter file and the what-if report are local working
@@ -304,7 +391,9 @@ try {
     }
 
     if (-not $PSCmdlet.ShouldProcess($VmName, "Deploy session host into '$ResourceGroupName' for '$RequestedForUpn'")) {
-        Write-Output "What-if completed for '$VmName'. No deployment was performed."
+        $diskPlan = "$OsDiskSku, $effectiveOsDiskSizeGB GiB"
+        if ($OsDiskPerformanceTier) { $diskPlan += ", performance tier $OsDiskPerformanceTier set after deployment" }
+        Write-Output "What-if completed for '$VmName' (OS disk: $diskPlan). No deployment was performed."
         return
     }
 
@@ -328,8 +417,44 @@ finally {
 }
 
 $vmId = [string]$deployment.properties.outputs.vmId.value
+$osDiskName = [string]$deployment.properties.outputs.osDiskName.value
+
+if ($OsDiskPerformanceTier) {
+    $diskUrl = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Compute/disks/${osDiskName}?api-version=2024-03-02"
+    $currentTier = Get-DiskTier -Url $diskUrl
+    if ($currentTier -ieq $OsDiskPerformanceTier) {
+        Write-Verbose "OS disk '$osDiskName' already uses performance tier $OsDiskPerformanceTier."
+    }
+    elseif ($PSCmdlet.ShouldProcess($osDiskName, "Set OS disk performance tier from '$currentTier' to '$OsDiskPerformanceTier'")) {
+        $tierBody = @{ properties = @{ tier = $OsDiskPerformanceTier } } | ConvertTo-Json -Compress
+        $tierBodyPath = Join-Path ([IO.Path]::GetTempPath()) "avd-disk-tier-$([Guid]::NewGuid().ToString('N')).json"
+        try {
+            $tierBody | Set-Content -LiteralPath $tierBodyPath -Encoding utf8
+            [void](Invoke-AzCliJson -ArgumentList @(
+                'rest', '--method', 'PATCH',
+                '--url', $diskUrl,
+                '--headers', 'Content-Type=application/json',
+                '--body', "@$tierBodyPath"
+            ))
+        }
+        finally {
+            Remove-Item -LiteralPath $tierBodyPath -Force -ErrorAction SilentlyContinue
+        }
+        # The update can complete asynchronously; confirm it before reporting.
+        $deadline = [DateTime]::UtcNow.AddMinutes(10)
+        while (($currentTier = Get-DiskTier -Url $diskUrl) -ine $OsDiskPerformanceTier) {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw "OS disk '$osDiskName' still reports tier '$currentTier' 10 minutes after requesting $OsDiskPerformanceTier."
+            }
+            Start-Sleep -Seconds 15
+        }
+    }
+}
+$osDiskTierText = if ($OsDiskPerformanceTier) { $OsDiskPerformanceTier } else { 'baseline' }
+
 Write-Output "##vso[task.setvariable variable=vmId;isOutput=true]$vmId"
+Write-Output "##vso[task.setvariable variable=osDiskName;isOutput=true]$osDiskName"
 Write-Output "##vso[task.setvariable variable=userObjectId;isOutput=true]$($user.id)"
 Write-Output "##vso[task.setvariable variable=deploymentName;isOutput=true]$deploymentName"
 Write-Output "##vso[task.setvariable variable=galleryImageVersionId;isOutput=true]$GalleryImageVersionId"
-Write-Output "Deployed or converged '$VmName' for '$RequestedForUpn' without a public IP address."
+Write-Output "Deployed or converged '$VmName' for '$RequestedForUpn' without a public IP address (OS disk: $OsDiskSku, $effectiveOsDiskSizeGB GiB, tier $osDiskTierText)."
